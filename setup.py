@@ -9,5 +9,8 @@ setup(
     author_email='rahuliitb16@gmail.com',
     license='unlicense',
     packages=['test_obs'],
+    include_package_data=True,
+    classifiers=[
+        'Programming Language :: Python :: 3.6'],
     zip_safe=False
 )
