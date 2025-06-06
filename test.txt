@@ -1,0 +1,32 @@
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+def filter_transactions_before_application(df: DataFrame, lag_months: int = None) -> DataFrame:
+    """
+    Filters transactions before the application month.
+
+    Parameters:
+    ----------
+    df : DataFrame
+        Spark DataFrame with:
+        - 'TJD': transaction date (timestamp or date)
+        - 'app_start_dt': application date (timestamp or date)
+
+    lag_months : int or None, default = None
+        - If set (e.g., 12), returns only the last N months before the application month.
+        - If None, returns all transactions before the application month.
+
+    Returns:
+    -------
+    DataFrame
+        Filtered Spark DataFrame based on the selected time window.
+    """
+    df = df.withColumn("app_month", F.trunc(F.col("app_start_dt"), "MM"))
+
+    if lag_months is None:
+        return df.filter(F.col("TJD") < F.col("app_month"))
+    else:
+        return df.filter(
+            (F.col("TJD") >= F.add_months(F.col("app_month"), -lag_months)) &
+            (F.col("TJD") < F.col("app_month"))
+        )
