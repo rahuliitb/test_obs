@@ -1,32 +1,65 @@
-from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-def filter_transactions_before_application(df: DataFrame, lag_months: int = None) -> DataFrame:
+def generate_monthly_transaction_aggregates(transactions_df):
     """
-    Filters transactions before the application month.
-
+    Generate transaction features at a monthly level and compute rolling-window averages
+    for 1-3, 1-6, 4-6, 7-9, 10-12, and 7-12 months excluding the application month.
+    
     Parameters:
-    ----------
-    df : DataFrame
-        Spark DataFrame with:
-        - 'TJD': transaction date (timestamp or date)
-        - 'app_start_dt': application date (timestamp or date)
-
-    lag_months : int or None, default = None
-        - If set (e.g., 12), returns only the last N months before the application month.
-        - If None, returns all transactions before the application month.
+    transactions_df (DataFrame): Input Spark DataFrame containing:
+        - application_id
+        - application_date
+        - transaction_date
+        - amount
+        - amount_flag
+        - eod_balance
+        - category
 
     Returns:
-    -------
-    DataFrame
-        Filtered Spark DataFrame based on the selected time window.
+    DataFrame: Features aggregated by application_id over custom time windows.
     """
-    df = df.withColumn("app_month", F.trunc(F.col("app_start_dt"), "MM"))
+    
+    # Compute the month difference from application date (exclude application month)
+    df = transactions_df.withColumn(
+        "month_diff", 
+        F.months_between("application_date", "transaction_date").cast("int")
+    ).filter((F.col("month_diff") >= 1) & (F.col("month_diff") <= 12))
 
-    if lag_months is None:
-        return df.filter(F.col("TJD") < F.col("app_month"))
-    else:
-        return df.filter(
-            (F.col("TJD") >= F.add_months(F.col("app_month"), -lag_months)) &
-            (F.col("TJD") < F.col("app_month"))
+    # Monthly aggregates
+    monthly_agg = df.groupBy("application_id", "month_diff").agg(
+        F.sum(F.when(F.col("amount_flag") == 1, F.col("amount"))).alias("credit_sum"),
+        F.sum(F.when(F.col("amount_flag") == 0, F.col("amount"))).alias("debit_sum"),
+        F.avg("eod_balance").alias("avg_eod_balance"),
+        F.count("*").alias("tx_count"),
+        F.countDistinct("category").alias("unique_category_count")
+    )
+
+    # Pivot by month_diff to get all 12 months as columns (if needed)
+    # But we will just use them as time series for aggregation
+
+    # Now aggregate into rolling windows
+    window_defs = {
+        "1_3": [1, 2, 3],
+        "1_6": [1, 2, 3, 4, 5, 6],
+        "4_6": [4, 5, 6],
+        "7_9": [7, 8, 9],
+        "10_12": [10, 11, 12],
+        "7_12": [7, 8, 9, 10, 11, 12],
+    }
+
+    feature_dfs = []
+
+    for label, months in window_defs.items():
+        agg = monthly_agg.filter(F.col("month_diff").isin(months)).groupBy("application_id").agg(
+            F.avg("credit_sum").alias(f"avg_credit_{label}m"),
+            F.avg("debit_sum").alias(f"avg_debit_{label}m"),
+            F.avg("avg_eod_balance").alias(f"avg_balance_{label}m"),
+            F.sum("tx_count").alias(f"tx_count_{label}m"),
+            F.avg("unique_category_count").alias(f"avg_unique_cat_{label}m")
         )
+        feature_dfs.append(agg)
+
+    from functools import reduce
+    final_df = reduce(lambda left, right: left.join(right, on="application_id", how="outer"), feature_dfs)
+
+    return final_df
