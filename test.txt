@@ -1,65 +1,125 @@
+from functools import reduce
 from pyspark.sql import functions as F
+from pyspark.sql import DataFrame
+from typing import List, Tuple, Optional
 
-def generate_monthly_transaction_aggregates(transactions_df):
+def generate_transaction_features(
+    trx_data: DataFrame,
+    lag_months: int = 12,
+    categories_to_exclude: Optional[List[str]] = None,
+    aggs: Optional[List[str]] = None,
+    window_def: Optional[List[Tuple[int, int]]] = None
+) -> DataFrame:
     """
-    Generate transaction features at a monthly level and compute rolling-window averages
-    for 1-3, 1-6, 4-6, 7-9, 10-12, and 7-12 months excluding the application month.
-    
-    Parameters:
-    transactions_df (DataFrame): Input Spark DataFrame containing:
-        - application_id
-        - application_date
-        - transaction_date
-        - amount
-        - amount_flag
-        - eod_balance
-        - category
+    Generate transaction and balance-based features over monthly and time-window aggregates.
 
-    Returns:
-    DataFrame: Features aggregated by application_id over custom time windows.
+    This function processes transaction and balance data to compute:
+        - Monthly credit/debit turnover
+        - Specific category-based payments
+        - Director/intra-group transfers
+        - Balance statistics like average, min, max, and negative balance days
+        - Windowed aggregations over defined monthly periods
+        - Liquidity stress index, trend, min balance last 3m, normalized min balance
+
+    Parameters
+    ----------
+    trx_data : DataFrame
+        Input Spark DataFrame containing transaction data, including balance and transaction records.
+    lag_months : int, optional
+        Number of months prior to the application month to consider for analysis (default is 12).
+    categories_to_exclude : list of str, optional
+        List of categories to exclude when computing turnover from credit transactions.
+        Default is:
+        ['Taxes - National', 'Insurance', 'Taxes - Local', 'Notaries',
+         'Taxes - Credit - National', 'Taxes - Credit - Local', 'Loans']
+    aggs : list of str, optional
+        List of aggregation functions to apply on each feature within defined time windows.
+        Supported values: ['mean', 'max', 'min']. Default is ['mean', 'max', 'min'].
+    window_def : list of tuple(int, int), optional
+        List of (start_month, end_month) tuples to define windows over which aggregations are calculated.
+        Default is [(1, 3), (4, 6), (7, 9), (10, 12), (1, 6), (1, 12)].
+
+    Returns
+    -------
+    DataFrame
+        Final aggregated DataFrame with all monthly and windowed features per application.
     """
-    
-    # Compute the month difference from application date (exclude application month)
-    df = transactions_df.withColumn(
-        "month_diff", 
-        F.months_between("application_date", "transaction_date").cast("int")
-    ).filter((F.col("month_diff") >= 1) & (F.col("month_diff") <= 12))
 
-    # Monthly aggregates
-    monthly_agg = df.groupBy("application_id", "month_diff").agg(
-        F.sum(F.when(F.col("amount_flag") == 1, F.col("amount"))).alias("credit_sum"),
-        F.sum(F.when(F.col("amount_flag") == 0, F.col("amount"))).alias("debit_sum"),
-        F.avg("eod_balance").alias("avg_eod_balance"),
-        F.count("*").alias("tx_count"),
-        F.countDistinct("category").alias("unique_category_count")
+    # ===== Default parameter handling =====
+    if categories_to_exclude is None:
+        categories_to_exclude = [
+            'Taxes - National', 'Insurance', 'Taxes - Local', 'Notaries',
+            'Taxes - Credit - National', 'Taxes - Credit - Local', 'Loans'
+        ]
+    if aggs is None:
+        aggs = ['mean', 'max', 'min']
+    if window_def is None:
+        window_def = [(1, 3), (4, 6), (7, 9), (10, 12), (1, 6), (1, 12)]
+
+    def filter_transactions_before_application_month(df: DataFrame, lag_months: int) -> DataFrame:
+        return df.filter(F.months_between("app_month", "TJD") <= lag_months)
+
+    trx_df = trx_data.filter(F.col("TOT").isNotNull())
+    trx_filtered = filter_transactions_before_application_month(trx_df, lag_months)
+    trx_filtered = trx_filtered.withColumn("month_diff", F.months_between(F.col("app_month"), F.trunc("TJD", "MM")).cast("int"))
+
+    monthly_agg = trx_filtered.groupBy("APPLICATION_ID", "month_diff").agg(
+        F.sum(F.when(F.col('ITC1') == 1, F.col("TOT")).otherwise(0)).alias("monthly_credit"),
+        F.sum(F.when(F.col('ITC1') == 0, F.col("TOT")).otherwise(0)).alias("monthly_debit"),
+        F.count("*").alias("total_trx_count"),
+        F.sum(F.when(F.col('ITC1') == 1, 1).otherwise(0)).alias("monthly_credit_trx_count"),
+        F.sum(F.when((F.col('ITC1') == 1) & (~F.col("category_1").isin(categories_to_exclude)), F.col('TOT')).otherwise(0)).alias("monthly_turnover_credit"),
+        F.sum(F.when(F.col("category_1") == "Loan Repayment", F.col("TOT")).otherwise(0)).alias("monthly_loan_repayment"),
+        F.sum(F.when(F.col("category_1") == "Utilities", F.col("TOT")).otherwise(0)).alias("monthly_utilities_payment"),
+        F.sum(F.when((F.col("category_1") == "Director Transfers") & (F.col("ITC1") == 1), F.col("TOT")).otherwise(0)).alias("monthly_credit_from_director"),
+        F.sum(F.when((F.col("category_1") == "Director Transfers") & (F.col("ITC1") == 0), F.col("TOT")).otherwise(0)).alias("monthly_credit_to_director"),
+        F.sum(F.when((F.col("category_1") == "Intra Group Transfer") & (F.col("ITC1") == 1), F.col("TOT")).otherwise(0)).alias("monthly_credit_from_intra_group_transfer"),
+        F.sum(F.when((F.col("category_1") == "Intra Group Transfer") & (F.col("ITC1") == 0), F.col("TOT")).otherwise(0)).alias("monthly_credit_to_intra_group_transfer"),
+        F.sum(F.when(F.col("category_2") == "Utilities - Water", F.col("TOT")).otherwise(0)).alias("monthly_utilities_water_payment"),
+        F.sum(F.when(F.col("category_2") == "Utilities - Gas and Electric", F.col("TOT")).otherwise(0)).alias("monthly_utilities_g&e_payment"),
+        F.sum(F.when(F.col("category_2") == "Utilities - Telecom", F.col("TOT")).otherwise(0)).alias("monthly_utilities_telecom_payment")
     )
 
-    # Pivot by month_diff to get all 12 months as columns (if needed)
-    # But we will just use them as time series for aggregation
+    balance_df = trx_data.filter(F.col("balance").isNotNull())
+    balance_filtered = filter_transactions_before_application_month(balance_df, lag_months)
+    balance_filtered = balance_filtered.withColumn("month_diff", F.months_between(F.col("app_month"), F.trunc("TJD", "MM")).cast("int"))
 
-    # Now aggregate into rolling windows
-    window_defs = {
-        "1_3": [1, 2, 3],
-        "1_6": [1, 2, 3, 4, 5, 6],
-        "4_6": [4, 5, 6],
-        "7_9": [7, 8, 9],
-        "10_12": [10, 11, 12],
-        "7_12": [7, 8, 9, 10, 11, 12],
-    }
+    balance_monthly = balance_filtered.groupBy("APPLICATION_ID", "month_diff").agg(
+        F.avg("balance").alias("monthly_avg_balance"),
+        F.min("balance").alias("monthly_min_balance"),
+        F.max("balance").alias("monthly_max_balance"),
+        F.sum(F.when(F.col("balance") < 0, 1).otherwise(0)).alias("num_days_negative_balance")
+    )
 
+    merged = balance_monthly.join(monthly_agg, on=["APPLICATION_ID", "month_diff"], how="outer")
+
+    columns_to_agg = [col for col in merged.columns if col not in ["APPLICATION_ID", "month_diff"]]
     feature_dfs = []
 
-    for label, months in window_defs.items():
-        agg = monthly_agg.filter(F.col("month_diff").isin(months)).groupBy("application_id").agg(
-            F.avg("credit_sum").alias(f"avg_credit_{label}m"),
-            F.avg("debit_sum").alias(f"avg_debit_{label}m"),
-            F.avg("avg_eod_balance").alias(f"avg_balance_{label}m"),
-            F.sum("tx_count").alias(f"tx_count_{label}m"),
-            F.avg("unique_category_count").alias(f"avg_unique_cat_{label}m")
+    for start_month, end_month in window_def:
+        filtered = merged.filter(
+            (F.col("month_diff") >= start_month) & (F.col("month_diff") <= end_month)
         )
+        agg_exprs = [
+            getattr(F, func)(col).alias(f"{col}_{func}_{start_month}_{end_month}")
+            for col in columns_to_agg for func in aggs
+        ]
+
+        liquidity_stress = (
+            F.sum(F.when(F.col("monthly_min_balance") < 10000, 1).otherwise(0)) /
+            F.count("*")
+        ).alias(f"liquidity_stress_index_{start_month}_{end_month}")
+
+        balance_trend = F.corr("month_diff", "monthly_avg_balance").alias(f"balance_trend_corr_{start_month}_{end_month}")
+
+        min_balance_last_3m = F.min("monthly_min_balance").alias(f"min_balance_last_3m_{start_month}_{end_month}")
+
+        norm_min_balance = (
+            F.min("monthly_min_balance") / F.mean("monthly_avg_balance")
+        ).alias(f"norm_min_balance_{start_month}_{end_month}")
+
+        agg = filtered.groupBy("APPLICATION_ID").agg(*agg_exprs, liquidity_stress, balance_trend, min_balance_last_3m, norm_min_balance)
         feature_dfs.append(agg)
 
-    from functools import reduce
-    final_df = reduce(lambda left, right: left.join(right, on="application_id", how="outer"), feature_dfs)
-
+    final_df = reduce(lambda left, right: left.join(right, on="APPLICATION_ID", how="outer"), feature_dfs)
     return final_df
