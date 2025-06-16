@@ -2,33 +2,34 @@ from pyspark.sql import functions as F
 
 def compute_pct_change_from_windows(df, window_pairs):
     """
-    Automatically detects column prefixes based on window suffixes,
-    and computes percentage change features for all matching prefix-window combinations.
-
+    Automatically computes percentage change features using inferred prefixes from window suffixes.
+    
     Args:
-        df (DataFrame): The input PySpark DataFrame.
-        window_pairs (List[Tuple[str, str]]): Time window suffix pairs, e.g., [('1_3m', '4_6m')].
-
+        df (DataFrame): Input PySpark DataFrame.
+        window_pairs (List[Tuple[str, str]]): List of time window suffix pairs.
+    
     Returns:
-        DataFrame: Transformed DataFrame with new percentage change features.
+        DataFrame: DataFrame with added percentage change features.
     """
-    # Step 1: Extract unique time window parts
-    window_parts = list(set(w for pair in window_pairs for w in pair))
+    # 1. Flatten all unique suffixes from window pairs
+    window_suffixes = {w for pair in window_pairs for w in pair}
+    
+    # 2. Pre-compute columns and build prefix map
+    col_set = set(df.columns)
+    prefix_map = {}
 
-    # Step 2: Infer prefixes by removing window suffixes from column names
-    prefixes = list(set(
-        col.replace(w, '') 
-        for col in df.columns 
-        for w in window_parts 
-        if col.endswith(w)
-    ))
+    for col in col_set:
+        for suffix in window_suffixes:
+            if col.endswith(suffix):
+                prefix = col[: -len(suffix)]
+                prefix_map.setdefault(prefix, set()).add(suffix)
+                break  # One match per column is enough
 
-    # Step 3: Compute percentage change features
-    for prefix in prefixes:
+    # 3. Compute percentage change features only for existing col pairs
+    for prefix, suffixes in prefix_map.items():
         for win1, win2 in window_pairs:
-            col1 = f"{prefix}{win1}"
-            col2 = f"{prefix}{win2}"
-            if col1 in df.columns and col2 in df.columns:
+            if win1 in suffixes and win2 in suffixes:
+                col1, col2 = f"{prefix}{win1}", f"{prefix}{win2}"
                 new_col = f"{prefix}pct_change_{win1}_to_{win2}"
                 df = df.withColumn(
                     new_col,
