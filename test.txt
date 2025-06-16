@@ -1,39 +1,64 @@
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
-def compute_pct_change_from_windows(df, window_pairs):
+def eod_balance_generation(trx_data):
     """
-    Automatically computes percentage change features using inferred prefixes from window suffixes.
-    
+    Generate End-of-Day (EOD) balances by forward-filling the latest balance per day
+    and aggregating balances at the APPLICATION_ID level.
+
     Args:
-        df (DataFrame): Input PySpark DataFrame.
-        window_pairs (List[Tuple[str, str]]): List of time window suffix pairs.
-    
+        trx_data (DataFrame): Input transaction DataFrame with required columns.
+
     Returns:
-        DataFrame: DataFrame with added percentage change features.
+        DataFrame: DataFrame with daily EOD balances aggregated across IBANs.
     """
-    # 1. Flatten all unique suffixes from window pairs
-    window_suffixes = {w for pair in window_pairs for w in pair}
-    
-    # 2. Pre-compute columns and build prefix map
-    col_set = set(df.columns)
-    prefix_map = {}
 
-    for col in col_set:
-        for suffix in window_suffixes:
-            if col.endswith(suffix):
-                prefix = col[: -len(suffix)]
-                prefix_map.setdefault(prefix, set()).add(suffix)
-                break  # One match per column is enough
+    # Required columns
+    required_columns = {"APPLICATION_ID", "IBAN", "TJD", "TSEQ", "ENDBAL", "app_start_dt"}
+    missing_columns = required_columns - set(trx_data.columns)
+    if missing_columns:
+        raise ValueError(f"Missing required columns in input DataFrame: {missing_columns}")
 
-    # 3. Compute percentage change features only for existing col pairs
-    for prefix, suffixes in prefix_map.items():
-        for win1, win2 in window_pairs:
-            if win1 in suffixes and win2 in suffixes:
-                col1, col2 = f"{prefix}{win1}", f"{prefix}{win2}"
-                new_col = f"{prefix}pct_change_{win1}_to_{win2}"
-                df = df.withColumn(
-                    new_col,
-                    F.when(F.col(col2) != 0, (F.col(col1) - F.col(col2)) / F.col(col2)).otherwise(None)
-                )
+    # Step 1: Select latest transaction per (APPLICATION_ID, IBAN, TJD)
+    w_latest = Window.partitionBy("APPLICATION_ID", "IBAN", "TJD").orderBy(F.desc("TSEQ"))
+    daily_latest = (
+        trx_data.withColumn("rn", F.row_number().over(w_latest))
+                .filter(F.col("rn") == 1)
+                .drop("rn")
+    )
 
-    return df
+    # Step 2: Define calendar range for each IBAN
+    trx_ranges = (
+        daily_latest.groupBy("APPLICATION_ID", "app_start_dt", "IBAN")
+        .agg(
+            F.min("TJD").alias("min_dt"),
+            F.max(F.trunc(F.col("app_start_dt"), "MM")).alias("app_month")
+        )
+    )
+
+    # Step 3: Generate daily date range (calendar) per IBAN
+    trx_ranges_expanded = trx_ranges.withColumn("TJD", F.explode(F.sequence("min_dt", "app_month")))
+
+    # Step 4: Join exploded calendar with daily-level balance data
+    df_full = trx_ranges_expanded.join(
+        daily_latest,
+        on=["APPLICATION_ID", "app_start_dt", "IBAN", "TJD"],
+        how="left"
+    )
+
+    # Step 5: Forward-fill ENDBAL per IBAN over time
+    w_fill = (
+        Window.partitionBy("APPLICATION_ID", "IBAN")
+              .orderBy("TJD")
+              .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    )
+
+    df_filled = df_full.withColumn("ENDBAL", F.last("ENDBAL", ignorenulls=True).over(w_fill))
+
+    # Step 6: Aggregate across IBANs per day (combine EOD balances)
+    df_eod_final = (
+        df_filled.groupBy("APPLICATION_ID", "app_start_dt", "TJD")
+                 .agg(F.sum("ENDBAL").alias("balance"))
+    )
+
+    return df_eod_final
