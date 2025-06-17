@@ -1,143 +1,40 @@
-from functools import reduce
-from typing import Dict, Optional, List
-from pyspark.sql import DataFrame
-import copy
-
-# Assuming these classes are implemented elsewhere:
-from expert_feature_modules import ConcentrationFeatures, TransactionFeatures
-
-class FeatureFactory:
-    """
-    Factory to compute expert-based features such as concentration-based and trend-based features.
-
-    Args:
-        config (dict, optional): A configuration dictionary for each feature. 
-                                 If not provided, a default configuration is used.
-
-    Required Columns in Input DataFrame:
-        - 'GRIDID'
-        - 'app_start_dt'
-        - 'TOT'
-        - 'TJD'
-        - 'ITC1'
-        - 'CACCT'
-        - 'CPLNAME'
-        - 'category_1'
-        - 'category_2'
-        - 'IBAN'
-        - 'TSEQ'
-        - 'ENDBAL'
-
-    Example:
-        factory = FeatureFactory()
-        df_out = factory.run(df)  # where df is a PySpark DataFrame with required columns
-    """
-
-    required_tnx_input_cols = [
-        'GRIDID', 'app_start_dt', 'TOT', 'TJD', 'ITC1', 'CACCT', 'CPLNAME',
-        'category_1', 'category_2', 'IBAN', 'TSEQ', 'ENDBAL'
-    ]
-
-    default_config = {
-        "Customer_Concentration": {
-            "N": 5,
-            "group_col": "CPLNAME",
-            "categories_to_exclude": [],
-            "feature_name": "Customer_Concentration"
-        },
-        "Supplier_Concentration": {
-            "N": 5,
-            "group_col": "CPLNAME",
-            "categories_to_exclude": [],
-            "feature_name": "Supplier_Concentration"
-        },
-        "TransactionFeatures": {
-            "lag_months": 12,
-            "categories_to_exclude": None,
-            "aggs": None,
-            "window_def": None,
-            "trend_feature": True
+default_config = {
+    "Customer_Concentration": {
+        "N": 5,
+        "group_col": "CPLNAME",
+        "categories_to_exclude": [],
+        "feature_name": "Customer_Concentration",
+        "_description": {
+            "N": "Number of top groups (e.g., customers) to consider for concentration calculation",
+            "group_col": "Column name to group by (e.g., counterparty name)",
+            "categories_to_exclude": "List of categories to exclude from calculation",
+            "feature_name": "Name of the generated feature column"
+        }
+    },
+    "Supplier_Concentration": {
+        "N": 5,
+        "group_col": "CPLNAME",
+        "categories_to_exclude": [],
+        "feature_name": "Supplier_Concentration",
+        "_description": {
+            "N": "Number of top groups (e.g., suppliers) to consider for concentration calculation",
+            "group_col": "Column name to group by (e.g., counterparty name)",
+            "categories_to_exclude": "List of categories to exclude from calculation",
+            "feature_name": "Name of the generated feature column"
+        }
+    },
+    "TransactionFeatures": {
+        "lag_months": 12,
+        "categories_to_exclude": None,
+        "aggs": None,
+        "window_def": None,
+        "trend_feature": True,
+        "_description": {
+            "lag_months": "Number of months to look back for aggregating transactions",
+            "categories_to_exclude": "Categories of transactions to exclude from feature calculation",
+            "aggs": "Aggregations to compute (e.g., sum, mean). If None, default aggregations are used",
+            "window_def": "Window definition for time-based calculations, if applicable",
+            "trend_feature": "Boolean indicating whether to compute trend features"
         }
     }
-
-    def __init__(self, config: Optional[Dict] = None):
-        # Deep copy defaults so we don't mutate the class-level dict
-        merged_config = copy.deepcopy(self.default_config)
-
-        if config:
-            # Merge provided config into defaults
-            for feature_name, feature_cfg in config.items():
-                if feature_name in merged_config:
-                    merged_config[feature_name].update(feature_cfg)
-                else:
-                    merged_config[feature_name] = feature_cfg
-
-        self.config = merged_config
-
-        # Initialize feature classes with merged config
-        self.available_features = {
-            "Customer_Concentration": ConcentrationFeatures(
-                N=self.config["Customer_Concentration"]["N"],
-                credit_or_debit=1,
-                group_col=self.config["Customer_Concentration"]["group_col"],
-                categories_to_exclude=self.config["Customer_Concentration"]["categories_to_exclude"],
-                feature_name=self.config["Customer_Concentration"]["feature_name"]
-            ),
-            "Supplier_Concentration": ConcentrationFeatures(
-                N=self.config["Supplier_Concentration"]["N"],
-                credit_or_debit=0,
-                group_col=self.config["Supplier_Concentration"]["group_col"],
-                categories_to_exclude=self.config["Supplier_Concentration"]["categories_to_exclude"],
-                feature_name=self.config["Supplier_Concentration"]["feature_name"]
-            ),
-            "TransactionFeatures": TransactionFeatures(
-                lag_months=self.config["TransactionFeatures"]["lag_months"],
-                categories_to_exclude=self.config["TransactionFeatures"]["categories_to_exclude"],
-                aggs=self.config["TransactionFeatures"]["aggs"],
-                window_def=self.config["TransactionFeatures"]["window_def"],
-                trend_feature=self.config["TransactionFeatures"]["trend_feature"]
-            )
-        }
-
-    def run(self, df: DataFrame, selected_features: Optional[List[str]] = None) -> DataFrame:
-        """
-        Run selected expert-based feature generators on the input DataFrame.
-
-        Args:
-            df (DataFrame): PySpark DataFrame containing all required columns.
-            selected_features (List[str], optional): List of features to compute. 
-                                                     If None, all available features are computed.
-
-        Returns:
-            DataFrame: PySpark DataFrame with additional expert-based features.
-        """
-
-        # Check for missing required columns
-        missing_columns = [col for col in FeatureFactory.required_tnx_input_cols if col not in df.columns]
-        if missing_columns:
-            raise ValueError(f"Missing required columns: {missing_columns}")
-
-        # If no specific features are selected, use all
-        if selected_features is None:
-            selected_features = list(self.available_features.keys())
-
-        feature_dataframes = []
-
-        for feature_name in selected_features:
-            feature_class = self.available_features.get(feature_name)
-            if feature_class:
-                df_feature = feature_class.transform(df)
-                feature_dataframes.append(df_feature)
-            else:
-                raise ValueError(f"Feature '{feature_name}' not found. Available: {list(self.available_features.keys())}")
-
-        # Combine all generated feature DataFrames on 'GRIDID'
-        if len(feature_dataframes) > 1:
-            feature_dataframe = reduce(
-                lambda x, y: x.join(y.drop('app_start_dt'), on='GRIDID', how='left'),
-                feature_dataframes
-            )
-        else:
-            feature_dataframe = feature_dataframes[0]
-
-        return feature_dataframe
+}
