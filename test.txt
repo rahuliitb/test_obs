@@ -1,64 +1,18 @@
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+from pyspark.sql import DataFrame
 
-def eod_balance_generation(trx_data):
+def check_required_columns(df: DataFrame, required_columns: list[str]) -> None:
     """
-    Generate End-of-Day (EOD) balances by forward-filling the latest balance per day
-    and aggregating balances at the APPLICATION_ID level.
-
+    Validates that all required columns exist in the DataFrame.
+    
     Args:
-        trx_data (DataFrame): Input transaction DataFrame with required columns.
-
-    Returns:
-        DataFrame: DataFrame with daily EOD balances aggregated across IBANs.
+        df (DataFrame): The PySpark DataFrame to check.
+        required_columns (list[str]): List of required column names.
+    
+    Raises:
+        ValueError: If any of the required columns are missing.
     """
-
-    # Required columns
-    required_columns = {"APPLICATION_ID", "IBAN", "TJD", "TSEQ", "ENDBAL", "app_start_dt"}
-    missing_columns = required_columns - set(trx_data.columns)
-    if missing_columns:
-        raise ValueError(f"Missing required columns in input DataFrame: {missing_columns}")
-
-    # Step 1: Select latest transaction per (APPLICATION_ID, IBAN, TJD)
-    w_latest = Window.partitionBy("APPLICATION_ID", "IBAN", "TJD").orderBy(F.desc("TSEQ"))
-    daily_latest = (
-        trx_data.withColumn("rn", F.row_number().over(w_latest))
-                .filter(F.col("rn") == 1)
-                .drop("rn")
-    )
-
-    # Step 2: Define calendar range for each IBAN
-    trx_ranges = (
-        daily_latest.groupBy("APPLICATION_ID", "app_start_dt", "IBAN")
-        .agg(
-            F.min("TJD").alias("min_dt"),
-            F.max(F.trunc(F.col("app_start_dt"), "MM")).alias("app_month")
-        )
-    )
-
-    # Step 3: Generate daily date range (calendar) per IBAN
-    trx_ranges_expanded = trx_ranges.withColumn("TJD", F.explode(F.sequence("min_dt", "app_month")))
-
-    # Step 4: Join exploded calendar with daily-level balance data
-    df_full = trx_ranges_expanded.join(
-        daily_latest,
-        on=["APPLICATION_ID", "app_start_dt", "IBAN", "TJD"],
-        how="left"
-    )
-
-    # Step 5: Forward-fill ENDBAL per IBAN over time
-    w_fill = (
-        Window.partitionBy("APPLICATION_ID", "IBAN")
-              .orderBy("TJD")
-              .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    )
-
-    df_filled = df_full.withColumn("ENDBAL", F.last("ENDBAL", ignorenulls=True).over(w_fill))
-
-    # Step 6: Aggregate across IBANs per day (combine EOD balances)
-    df_eod_final = (
-        df_filled.groupBy("APPLICATION_ID", "app_start_dt", "TJD")
-                 .agg(F.sum("ENDBAL").alias("balance"))
-    )
-
-    return df_eod_final
+    df_columns = df.columns
+    missing = [col for col in required_columns if col not in df_columns]
+    
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
