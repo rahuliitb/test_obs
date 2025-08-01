@@ -1,40 +1,59 @@
-default_config = {
-    "Customer_Concentration": {
-        "N": 5,
-        "group_col": "CPLNAME",
-        "categories_to_exclude": [],
-        "feature_name": "Customer_Concentration",
-        "_description": {
-            "N": "Number of top groups (e.g., customers) to consider for concentration calculation",
-            "group_col": "Column name to group by (e.g., counterparty name)",
-            "categories_to_exclude": "List of categories to exclude from calculation",
-            "feature_name": "Name of the generated feature column"
-        }
-    },
-    "Supplier_Concentration": {
-        "N": 5,
-        "group_col": "CPLNAME",
-        "categories_to_exclude": [],
-        "feature_name": "Supplier_Concentration",
-        "_description": {
-            "N": "Number of top groups (e.g., suppliers) to consider for concentration calculation",
-            "group_col": "Column name to group by (e.g., counterparty name)",
-            "categories_to_exclude": "List of categories to exclude from calculation",
-            "feature_name": "Name of the generated feature column"
-        }
-    },
-    "TransactionFeatures": {
-        "lag_months": 12,
-        "categories_to_exclude": None,
-        "aggs": None,
-        "window_def": None,
-        "trend_feature": True,
-        "_description": {
-            "lag_months": "Number of months to look back for aggregating transactions",
-            "categories_to_exclude": "Categories of transactions to exclude from feature calculation",
-            "aggs": "Aggregations to compute (e.g., sum, mean). If None, default aggregations are used",
-            "window_def": "Window definition for time-based calculations, if applicable",
-            "trend_feature": "Boolean indicating whether to compute trend features"
-        }
-    }
-}
+
+The features are categorized into five broad categories, each derived from the transactional behavior of entities across multiple time windows and statistical aggregations.
+
+1. Transaction Amount-Based Features (f_trx): 
+Transaction features are derived from raw transaction amounts (credits and debits) using statistical aggregations (sum, count, mean, max, min, std) over multiple time horizons (1m, 3m, 6m, 12m). 
+Additional features include ratios between time periods (e.g. 3m vs 12m), trends capturing directional changes, and timing-based metrics such as behavior after a specific day of the month.
+
+Example: 
+f_trx_3m_credit_sum: Sum of all credit transactions in the past 3 month
+f_trx_3m_debit_after_21_days_of_month_start_stddev: Std dev of debit transactions done after the 21st in the last 3 months
+f_trx_1m_amount_sum: Total transaction amount (debit + credit) in the last month
+f_trx_3m_credit_sum_6m_credit_sum_12m_credit_sum_trend: Credit transaction trend over 3m → 6m → 12m
+
+2. Balance-Based Features (f_bal): 
+Balance features are computed from daily balance values using similar time windows and stats as transaction features. 
+The balance feature also include conditional based features(for example only positive or only negative balances), ratio features comparing different balance types (for example, is_positive vs is_negative) and Trend feature.
+
+Example:
+f_bal_1m_balance_is_positive_sum: Number of days with positive balances in the last month.
+f_bal_3m_balance_negative_value_mean_3m_balance_positive_value_mean_ratio: Ratio of mean negative balance to mean positive balance over the past 3 months.
+
+3. Categorized Transaction Features (f_cat):
+
+Categorized features are computed for predefined transaction categories such as taxes, utilities, director transfers, etc.
+Like transaction and balance features, these are aggregated over multiple time windows (e.g., 1m, 3m, 6m, 12m) using standard statistics (sum, count, mean, max, min, std).
+Ratio and trend features are also generated to capture relative and directional changes over time
+
+Example:
+f_cat_1m_Utilities_debit_count: Count of utility debit transactions in 1 month.
+f_cat_1m_Director_Transfers_debit_sum: Sum of director debit transfers in 1 month.
+f_cat_3m_Director_Transfers_credit_sum_6m_Director_Transfers_credit_sum_12m_Director_Transfers_credit_sum_trend: Trend of credit transactions for directors over 3m, 6m, and 12m.
+
+4. Counterparty-Based Features (f_cp)
+These features are generated using counterparty-level information from transactions data. Features are computed at different horizons(6m and 12m).
+Additional counterparty-Based Features(e.g., customer/supplier concentration e) are generated using other_income categories for top N counterparties over time windows such as (1,3m), (1,6m), (4,6m), (7,12m), and (1,12m).
+
+Feature type generaed:
+% of debit/credit amount per counterparty
+Count concentration per counterparty
+HHI index for counterparty concentration
+Time-based comparison and % change
+
+Example: 
+f_cp_6m_debit_trx_amount_percentage_per_cp_max: Highest percentage contribution of any counterparty to debit amount in 6 months.
+f_cp_cats_excl_supplier_conc_3_pct_change_1_3m_to_4_6m: % change in concentration of top 3 non-supplier counterparties from 1–3m to 4–6m.
+
+5.Expert-Derived Features (f_exp):
+
+Expert based features are built on monthly aggregations (such as the sum of monthly credit/debit, min/max/mean of monthly balances etc.) of transaction amounts, balances, and categories specific such as Loan Repayment, Director Transfers, Taxes etc. 
+we compute summary statistics(min, max, mean, sum) over different time windows(1-3m, 4-6m, 1-6m,7-12m, 1-12m). For each of these windows, all relevant features are generated using the monthly values.
+Based on these aggregated values, we then derive ratio-based features that are relevant from a business perspective.
+for example the loan repayment to turnover ratio, calculated by dividing the total loan repayment amount by the turnover within a given time window.This ratio is computed across all defined time periods.
+To capture behavioral changes over time, we also compute percentage change features. These are calculated by comparing earlier and later periods, such as from 1–3m to 4–6m, and from 1–6m to 7–12m.
+
+Example:
+f_exp_m_avg_balance_mean_1_3m: Average of monthly average balances over the first 3 months
+f_exp_m_avg_balance_max_1_3m: Maximum of monthly average balances in the 1–3 month window
+f_exp_m_trx_count_min_pct_change_1_3m_to_4_6m: % change in minimum monthly transaction count from 1–3m to 4–6m
+f_exp_m_utilities_g&e_mean_pct_change_1_6m_to_7_12m: % change in average monthly utility (gas & electricity) spend from 1–6m to 7–12m
