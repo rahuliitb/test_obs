@@ -1,1 +1,147 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import GroupKFold
+from feature_engine.selection import DropHighPSIFeatures
+
+# ---------- Simulate data: 10k customers per year, 2019 vs 2020 with drift ----------
+rng = np.random.default_rng(123)
+n_per_year = 10_000
+
+months = np.array([f"{m:02d}" for m in range(1, 13)])
+
+def make_year(year, n, mean, sd=10):
+    mlabels = np.tile(months, int(np.ceil(n/12)))[:n]
+    rng.shuffle(mlabels)
+    yyyy_mm = [f"{year}-{m}" for m in mlabels]
+    return pd.DataFrame({
+        "YYYYMM": yyyy_mm,
+        "year": year,
+        "feat1": rng.normal(mean, sd, size=n)
+    })
+
+df = pd.concat([
+    make_year(2019, n_per_year, mean=50, sd=10),
+    make_year(2020, n_per_year, mean=60, sd=10)
+], ignore_index=True)
+
+
+# # Simulate initial full dataset
+# rng = np.random.default_rng(2025)
+
+# def simulate_year(year, n_total, base_mean, base_sd=10.0,
+#                   seasonal_amp=2.0, noise_sd=0.8):
+#     months = np.arange(1, 13)
+#     counts = np.repeat(n_total // 12, 12)
+#     seasonal = seasonal_amp * np.sin(2 * np.pi * (months - 1) / 12.0)
+#     month_means = base_mean + seasonal + rng.normal(0.0, noise_sd, size=12)
+#     rows = []
+#     for m, cnt in zip(months, counts):
+#         vals = rng.normal(loc=month_means[m-1], scale=base_sd, size=cnt)
+#         rows.append(pd.DataFrame({"year": year, "YYYYMM": f"{year}-{m:02d}", "feat1": vals}))
+#     return pd.concat(rows, ignore_index=True)
+
+# # Start with equal monthly counts, then drop randomly to make uneven
+# N_PER_YEAR = 12_000
+# df2019 = simulate_year(2019, N_PER_YEAR, base_mean=50.0, base_sd=10.0)
+# df2020 = simulate_year(2020, N_PER_YEAR, base_mean=55.0, base_sd=10.0)
+
+# def drop_randomly(df, min_frac=0.5, max_frac=0.9):
+#     out = []
+#     for month in df["YYYYMM"].unique():
+#         sub = df[df["YYYYMM"] == month]
+#         frac = rng.uniform(min_frac, max_frac)
+#         out.append(sub.sample(frac=frac, random_state=2025))
+#     return pd.concat(out, ignore_index=True)
+
+# df2019_uneven = drop_randomly(df2019, min_frac=0.5, max_frac=0.9)
+# df2020_uneven = drop_randomly(df2020, min_frac=0.5, max_frac=0.9)
+
+# df = pd.concat([df2019_uneven, df2020_uneven], ignore_index=True)
+
+
+
+# ---------- Pure PSI: 2019 (basis) vs 2020 (test) in both directions ----------
+df_pure = df.copy()
+df_pure["split"] = np.where(df_pure["year"] == 2019, "basis", "test")
+
+dhp_fwd = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency")
+dhp_fwd.fit(df_pure[["feat1", "split"]])
+psi_pure_forward = dhp_fwd.psi_values_["feat1"]
+
+dhp_rev = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency", switch=True)
+dhp_rev.fit(df_pure[["feat1", "split"]])
+psi_pure_reverse = dhp_rev.psi_values_["feat1"]
+
+# ---------- GroupKFold(5) on YYYYMM with forward & reverse per fold ----------
+gkf = GroupKFold(n_splits=5)
+rows = []
+
+for fold, (train_idx, test_idx) in enumerate(gkf.split(df, groups=df["YYYYMM"])):
+    tmp = df[["feat1", "YYYYMM"]].copy()
+    tmp["split"] = "test"
+    tmp.loc[tmp.index.isin(train_idx), "split"] = "basis"
+    
+    dhp_fold_fwd = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency")
+    dhp_fold_fwd.fit(tmp[["feat1", "split"]])
+    psi_forward = dhp_fold_fwd.psi_values_["feat1"]
+    
+    dhp_fold_rev = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency", switch=True)
+    dhp_fold_rev.fit(tmp[["feat1", "split"]])
+    psi_reverse = dhp_fold_rev.psi_values_["feat1"]
+    
+    rows.append({"Fold": fold,
+                 "PSI_forward": psi_forward,
+                 "PSI_reverse": psi_reverse})
+
+df_folds = pd.DataFrame(rows).sort_values("Fold").reset_index(drop=True)
+
+
+# ---------- Plot: PSI per fold (forward vs reverse) ----------
+plt.figure()
+x = np.arange(len(df_folds))
+width = 0.35
+plt.bar(x - width/2, df_folds["PSI_forward"], width, label="Forward (refer→test)")
+plt.bar(x + width/2, df_folds["PSI_reverse"], width, label="Reverse (test→train)")
+plt.xticks(x, [f"Fold {i}" for i in df_folds["Fold"]])
+plt.ylabel("PSI")
+plt.title("PSI per Fold (Forward vs Reverse) — GroupKFold on YYYYMM")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------- Also show pure PSI as reference in text ----------
+print(f"Pure PSI 2019→2020 (forward): {psi_pure_forward:.4f}")
+print(f"Pure PSI 2020→2019 (reverse): {psi_pure_reverse:.4f}")
+
+
+# from scipy.stats import ks_2samp
+# ref =df2019_uneven['feat1']
+# act = df2020_uneven['feat1']
+# # Compute KS statistic and p-value
+# ks_stat, ks_pval = ks_2samp(ref, act)
+
+# #tools.display_dataframe_to_user("PSI and KS summary", summary_with_ks)
+
+# # Plot the empirical CDFs to visualize the KS statistic
+# def ecdf(data):
+#     """Compute ECDF for a 1D array of measurements."""
+#     x = np.sort(data)
+#     y = np.arange(1, len(x)+1) / len(x)
+#     return x, y
+
+# x_ref, y_ref = ecdf(ref)
+# x_act, y_act = ecdf(act)
+
+# plt.figure(figsize=(8,6))
+# plt.plot(x_ref, y_ref, label="Reference ECDF")
+# plt.plot(x_act, y_act, label="Actual ECDF")
+# plt.title(f"Empirical CDFs (KS statistic = {ks_stat:.4f}, p={ks_pval:.4e})")
+# plt.xlabel("Value")
+# plt.ylabel("ECDF")
+# plt.legend()
+# plt.grid(True)
+# plt.tight_layout()
+# plt.show()
+
 
