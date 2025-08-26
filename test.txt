@@ -153,3 +153,174 @@ def univariate_lgbm_importance_randomcv_parallel(
     return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
 
+from pyspark.sql import functions as F, Window as W
+
+# --- Load base table
+df = spark.table("tracracc.app_data_20250820")
+
+# --- Flags (edit any rule logic as needed)
+df = (df
+  .withColumn("f01_has_acct",        (F.col("SCOPE_HAS_ACNT_FLG") == 1))
+  .withColumn("f02_cust_type",       (F.col("SCOPE_CUST_TYPE_FLG") == 1))
+  .withColumn("f03_mom_segm",        (F.col("SCOPE_MOM_SEGM_FLG") == 1))
+  .withColumn("f04_exc_rating",      (F.coalesce(F.col("SCOPE_EXC_RATING_NBR_FLG"), F.lit(0)) == 1))
+  .withColumn("f05_legal_form",      (F.col("SCOPE_LEGAL_FORM_FLG") == 1))
+  .withColumn("f06_limit_amt",       (F.col("SCOPE_LMT_AMT_FLG") == 1))
+  .withColumn("f07_model_prefix",    (F.col("SCOPE_MODEL_PREFIX_FLG") == 1))
+  .withColumn("f08_dpd30_ok",        (F.coalesce(F.col("MAX_DPD_OVER_30_FLG"), F.lit(0)) == 1))
+  .withColumn("f09_not_kos_imputed", ~((F.col("SOURCE") == F.lit("KOS")) & (F.col("IMPUTED_START_DT_FLG") == 1)))
+  .withColumn("f10_max_days",        (F.col("SCOPE_MAX_DAYS_UNTIL_DISB_FLG") == 1))
+  .withColumn("f11_l00_after_ok",    (F.col("L00_AFTER") >= F.lit(-50000000)))  # adjust bound if needed
+  .withColumn("f12_bad_elig_ok",     (F.coalesce(F.col("MAX_BAD_ELG_UNTIL_DISB_JCO"), F.lit(0)) == 1))
+  .withColumn("f13_main_grid_ok",    (F.col("MAIN_GRID_ID").isNotNull()))
+  .withColumn("f14_bad_flag_notnull",(F.col("MAX_BAD_FLG_24M_JCO").isNotNull()))
+  .withColumn("f15_ctry_ok",         (F.coalesce(F.col("CTRY_OF_RESIDENCE_MAIN"), F.lit("NL")).isin("NL","ENL")))
+)
+
+# --- Cumulative passes
+dfp = (df
+  .withColumn("p01", F.col("f01_has_acct"))
+  .withColumn("p02", F.col("p01") & F.col("f02_cust_type"))
+  .withColumn("p03", F.col("p02") & F.col("f03_mom_segm"))
+  .withColumn("p04", F.col("p03") & F.col("f04_exc_rating"))
+  .withColumn("p05", F.col("p04") & F.col("f05_legal_form"))
+  .withColumn("p06", F.col("p05") & F.col("f06_limit_amt"))
+  .withColumn("p07", F.col("p06") & F.col("f07_model_prefix"))
+  .withColumn("p08", F.col("p07") & F.col("f08_dpd30_ok"))
+  .withColumn("p09", F.col("p08") & F.col("f09_not_kos_imputed"))
+  .withColumn("p10", F.col("p09") & F.col("f10_max_days"))
+  .withColumn("p11", F.col("p10") & F.col("f11_l00_after_ok"))
+  .withColumn("p12", F.col("p11") & F.col("f12_bad_elig_ok"))
+  .withColumn("p13", F.col("p12") & F.col("f13_main_grid_ok"))
+  .withColumn("p14", F.col("p13") & F.col("f14_bad_flag_notnull"))
+  .withColumn("p15", F.col("p14") & F.col("f15_ctry_ok"))
+)
+
+# --- Helper: distinct count of prod_key conditional on an expression
+def cnt(expr):
+    return F.countDistinct(F.when(expr, F.col("prod_key")))
+
+# --- Aggregate (remaining after each step + bads remaining after each step)
+wide_counts = dfp.agg(
+    # Remaining
+    F.countDistinct("prod_key").alias("after_00_universe"),
+    cnt(F.col("p01")).alias("after_01_has_acct"),
+    cnt(F.col("p02")).alias("after_02_cust_type"),
+    cnt(F.col("p03")).alias("after_03_mom_segm"),
+    cnt(F.col("p04")).alias("after_04_exc_rating"),
+    cnt(F.col("p05")).alias("after_05_legal_form"),
+    cnt(F.col("p06")).alias("after_06_limit_amt"),
+    cnt(F.col("p07")).alias("after_07_model_prefix"),
+    cnt(F.col("p08")).alias("after_08_dpd30_ok"),
+    cnt(F.col("p09")).alias("after_09_not_kos_imputed"),
+    cnt(F.col("p10")).alias("after_10_max_days"),
+    cnt(F.col("p11")).alias("after_11_l00_after_ok"),
+    cnt(F.col("p12")).alias("after_12_bad_elig_ok"),
+    cnt(F.col("p13")).alias("after_13_main_grid_ok"),
+    cnt(F.col("p14")).alias("after_14_bad_flag_notnull"),
+    cnt(F.col("p15")).alias("after_15_ctry_ok"),
+
+    # Bads remaining (MAX_BAD_FLG_24M_JCO = 1) at each stage
+    cnt(F.col("MAX_BAD_FLG_24M_JCO") == 1).alias("bads_00_universe"),
+    cnt(F.col("p01") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_01_has_acct"),
+    cnt(F.col("p02") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_02_cust_type"),
+    cnt(F.col("p03") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_03_mom_segm"),
+    cnt(F.col("p04") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_04_exc_rating"),
+    cnt(F.col("p05") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_05_legal_form"),
+    cnt(F.col("p06") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_06_limit_amt"),
+    cnt(F.col("p07") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_07_model_prefix"),
+    cnt(F.col("p08") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_08_dpd30_ok"),
+    cnt(F.col("p09") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_09_not_kos_imputed"),
+    cnt(F.col("p10") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_10_max_days"),
+    cnt(F.col("p11") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_11_l00_after_ok"),
+    cnt(F.col("p12") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_12_bad_elig_ok"),
+    cnt(F.col("p13") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_13_main_grid_ok"),
+    cnt(F.col("p14") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_14_bad_flag_notnull"),
+    cnt(F.col("p15") & (F.col("MAX_BAD_FLG_24M_JCO") == 1)).alias("bads_15_ctry_ok")
+)
+
+# --- Unpivot to long (one row per step)
+labels = [
+    "Universe",
+    "Has account",
+    "Customer type",
+    "MOM segment",
+    "Excl rating OK",
+    "Legal form",
+    "Limit amount",
+    "Model prefix",
+    "DPD>30 rule",
+    "Not KOS+imputed",
+    "Max days until disb",
+    "L00 after bound",
+    "Bad eligibility",
+    "Main grid present",
+    "Bad flag not null",
+    "Country check",
+]
+
+# Build arrays for remaining and bads from the single wide_counts row
+long_df = (wide_counts
+  .select(
+    F.array(
+      F.col("after_00_universe"),
+      F.col("after_01_has_acct"),
+      F.col("after_02_cust_type"),
+      F.col("after_03_mom_segm"),
+      F.col("after_04_exc_rating"),
+      F.col("after_05_legal_form"),
+      F.col("after_06_limit_amt"),
+      F.col("after_07_model_prefix"),
+      F.col("after_08_dpd30_ok"),
+      F.col("after_09_not_kos_imputed"),
+      F.col("after_10_max_days"),
+      F.col("after_11_l00_after_ok"),
+      F.col("after_12_bad_elig_ok"),
+      F.col("after_13_main_grid_ok"),
+      F.col("after_14_bad_flag_notnull"),
+      F.col("after_15_ctry_ok"),
+    ).alias("remaining_arr"),
+    F.array(
+      F.col("bads_00_universe"),
+      F.col("bads_01_has_acct"),
+      F.col("bads_02_cust_type"),
+      F.col("bads_03_mom_segm"),
+      F.col("bads_04_exc_rating"),
+      F.col("bads_05_legal_form"),
+      F.col("bads_06_limit_amt"),
+      F.col("bads_07_model_prefix"),
+      F.col("bads_08_dpd30_ok"),
+      F.col("bads_09_not_kos_imputed"),
+      F.col("bads_10_max_days"),
+      F.col("bads_11_l00_after_ok"),
+      F.col("bads_12_bad_elig_ok"),
+      F.col("bads_13_main_grid_ok"),
+      F.col("bads_14_bad_flag_notnull"),
+      F.col("bads_15_ctry_ok"),
+    ).alias("bads_arr")
+  )
+  .select(
+    F.posexplode("remaining_arr").alias("step","remaining"),
+    F.col("bads_arr")[F.col("step")].alias("bads_remaining")
+  )
+)
+
+# Add labels, drop count, and bad rate
+w = W.orderBy("step")
+waterfall_df = (long_df
+  .withColumn("label", F.array([F.lit(x) for x in labels])[F.col("step")])
+  .withColumn("prev_remaining", F.lag("remaining").over(w))
+  .withColumn("dropped_at_step", F.when(F.col("prev_remaining").isNull(), F.lit(0))
+                                  .otherwise(F.col("prev_remaining") - F.col("remaining")))
+  .withColumn("bad_rate", F.when(F.col("remaining") > 0, F.col("bads_remaining") / F.col("remaining")))
+  .select("step","label","remaining","dropped_at_step","bads_remaining","bad_rate")
+  .orderBy("step")
+)
+
+# --- Use it
+# display(waterfall_df)            # Databricks
+# waterfall_df.show(50, truncate=False)
+# waterfall_df.write.mode("overwrite").format("delta").saveAsTable("sandbox.waterfall_app_filters")
+
+
+
