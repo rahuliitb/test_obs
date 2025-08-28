@@ -181,6 +181,72 @@ long_df = (wide_counts
   .select("step", "remaining", "bads_remaining")
 )
 
+from pyspark.sql import functions as F
+
+lag_months = 12
+
+# Step 1: Truncate dates
+joined_df_ana = (
+    joined_df
+    .withColumn("app_month", F.trunc("APP_START_DT", "MM"))
+    .withColumn("trx_month", F.trunc("TJD", "MM"))
+)
+
+# Step 2: Minimum transaction month per application
+df_min_trx = (
+    joined_df_ana
+    .groupBy("PROD_KEY", "GRIDID", "app_month")
+    .agg(F.min("trx_month").alias("min_trx_date"))
+)
+
+# Step 3: Flag whether borrower has ≥ lag_months history
+df_result = df_min_trx.withColumn(
+    "has_lag_month_history",
+    F.col("min_trx_date").isNotNull() &
+    (F.col("app_month") >= F.add_months(F.col("min_trx_date"), lag_months))
+)
+
+# Step 4: Join back (KEEP ALL applications, no filter here)
+df_with_flag = joined_df_ana.join(
+    F.broadcast(df_result), on=["PROD_KEY", "GRIDID", "app_month"], how="left"
+)
+
+# Step 5: Filter transactions in the last lag_months before app_month
+df_last_12_months = df_with_flag.filter(
+    (F.col("TJD") >= F.add_months(F.col("app_month"), -lag_months)) &
+    (F.col("TJD") <= F.col("app_month"))
+)
+
+# Step 6: Monthly transaction counts
+df_month_counts = (
+    df_last_12_months
+    .groupBy("PROD_KEY", "GRIDID", "app_month", "trx_month", "has_lag_month_history")
+    .agg(
+        F.count("*").alias("monthly_trx_count"),
+        F.sum(F.when(F.col("ITC1") == 1, 1).otherwise(0)).alias("m_credit_trx_count")
+    )
+)
+
+# Step 7: Aggregate at application level
+df_final = (
+    df_month_counts
+    .groupBy("PROD_KEY", "GRIDID", "app_month", "has_lag_month_history")
+    .agg(
+        F.countDistinct("trx_month").alias("active_month"),
+        F.min("monthly_trx_count").alias("min_trx_count_nonzero"),
+        F.sum("m_credit_trx_count").alias("total_credit_trx_count"),
+        F.sum("monthly_trx_count").alias("total_trx_count")
+    )
+    .withColumn(
+        "min_trx_count",
+        F.when(F.col("active_month") == lag_months, F.col("min_trx_count_nonzero"))
+         .otherwise(F.lit(0))
+    )
+    .drop("min_trx_count_nonzero")
+)
+
+# Final output
+df_final.show(truncate=False)
 
 
 
