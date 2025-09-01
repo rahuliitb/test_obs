@@ -248,5 +248,38 @@ df_final = (
 # Final output
 df_final.show(truncate=False)
 
+def spark_memory_summary(spark):
+    conf = spark.sparkContext.getConf()
+    
+    # Read config values
+    executor_mem_gb = float(conf.get("spark.executor.memory", "0g").replace("g", ""))
+    driver_mem_gb   = float(conf.get("spark.driver.memory", "0g").replace("g", ""))
+    max_executors   = int(conf.get("spark.dynamicAllocation.maxExecutors", 
+                                   conf.get("spark.executor.instances", "0")))
+    
+    # JVM overhead (default: 10% of executor/driver mem, min 384 MB)
+    executor_overhead = max(0.384, executor_mem_gb * 0.10)
+    driver_overhead   = max(0.384, driver_mem_gb * 0.10)
+    
+    # Totals
+    total_executor_heap    = executor_mem_gb * max_executors
+    total_driver_heap      = driver_mem_gb
+    total_heap             = total_executor_heap + total_driver_heap
+    
+    total_executor_request = (executor_mem_gb + executor_overhead) * max_executors
+    total_driver_request   = driver_mem_gb + driver_overhead
+    total_cluster_request  = total_executor_request + total_driver_request
+    
+    return {
+        "executor_memory_gb": executor_mem_gb,
+        "driver_memory_gb": driver_mem_gb,
+        "max_executors": max_executors,
+        "total_heap_gb": total_heap,
+        "total_cluster_memory_with_overhead_gb": total_cluster_request
+    }
+
+print(spark_memory_summary(spark))
+
+
 
 
