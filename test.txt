@@ -281,5 +281,62 @@ def spark_memory_summary(spark):
 print(spark_memory_summary(spark))
 
 
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Provided data
+df = pd.DataFrame({
+    "threshold": [1, 1, 1, 1, 2, 2, 2, 2]*3,
+    "application_count": [100, 120, 140, 160, 110, 130, 150, 170]*3,
+    "target_count": [10, 15, 20, 25, 12, 18, 22, 28]*3,
+    "type": ["min_types", "min_types", "total", "total"]*6,
+    "segment": ["main", "any", "combined", "main"]*6
+})
+
+# Melt so we can plot both application_count and target_count
+df_melt = df.melt(
+    id_vars=["threshold", "type", "segment"],
+    value_vars=["application_count", "target_count"],
+    var_name="metric",
+    value_name="count"
+)
+
+# Get unique segments for plotting
+segments = df_melt['segment'].unique()
+
+fig, axes = plt.subplots(1, len(segments), figsize=(18, 5), sharey=True)
+
+for i, seg in enumerate(segments):
+    ax = axes[i] if len(segments) > 1 else axes
+    data_seg = df_melt[df_melt['segment'] == seg]
+    sns.barplot(
+        data=data_seg,
+        x="threshold",
+        y="count",
+        hue="type",
+        ci=None,
+        palette="Set2",
+        ax=ax
+    )
+    # Overlay application/target as hatch or alpha
+    for metric, hatch in zip(['application_count', 'target_count'], ['', '//']):
+        data_metric = data_seg[data_seg['metric'] == metric]
+        bars = ax.patches
+        for bar, val in zip(bars, data_metric['count']):
+            bar.set_hatch(hatch)
+    ax.set_title(f"Segment: {seg}")
+    ax.set_xlabel("Threshold")
+    if i == 0:
+        ax.set_ylabel("Count")
+    else:
+        ax.set_ylabel("")
+    ax.legend(title="Type")
+
+fig.suptitle("Application & Target Counts by Threshold and Type for Each Segment", fontsize=16, y=1.05)
+plt.tight_layout()
+plt.show()
+
+
 
 
