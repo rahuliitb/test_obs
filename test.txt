@@ -151,192 +151,189 @@ def univariate_lgbm_importance_randomcv_parallel(
         sort_col = "AUC_valid_no_impute"
 
     return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-long_df = (wide_counts
-  .select(
-    F.array(
-      F.col("after_00_universe"), F.col("after_01_has_acct"), F.col("after_02_cust_type"),
-      F.col("after_03_mom_segm"), F.col("after_04_exc_rating"), F.col("after_05_legal_form"),
-      F.col("after_06_limit_amt"), F.col("after_07_model_prefix"), F.col("after_08_dpd30_ok"),
-      F.col("after_09_not_kos_imputed"), F.col("after_10_max_days"), F.col("after_11_l00_after_ok"),
-      F.col("after_12_bad_elig_ok"), F.col("after_13_main_grid_ok"), F.col("after_14_bad_flag_notnull"),
-      F.col("after_15_ctry_ok")
-    ).alias("remaining_arr"),
-    F.array(
-      F.col("bads_00_universe"), F.col("bads_01_has_acct"), F.col("bads_02_cust_type"),
-      F.col("bads_03_mom_segm"), F.col("bads_04_exc_rating"), F.col("bads_05_legal_form"),
-      F.col("bads_06_limit_amt"), F.col("bads_07_model_prefix"), F.col("bads_08_dpd30_ok"),
-      F.col("bads_09_not_kos_imputed"), F.col("bads_10_max_days"), F.col("bads_11_l00_after_ok"),
-      F.col("bads_12_bad_elig_ok"), F.col("bads_13_main_grid_ok"), F.col("bads_14_bad_flag_notnull"),
-      F.col("bads_15_ctry_ok")
-    ).alias("bads_arr")
-  )
-  # 1) Create step/remaining + keep bads_arr
-  .select(
-    F.posexplode("remaining_arr").alias("step", "remaining"),
-    F.col("bads_arr")
-  )
-  # 2) Now you can reference step
-  .withColumn("bads_remaining", F.col("bads_arr")[F.col("step")])
-  .select("step", "remaining", "bads_remaining")
-)
-
-from pyspark.sql import functions as F
-
-lag_months = 12
-
-# Step 1: Truncate dates
-joined_df_ana = (
-    joined_df
-    .withColumn("app_month", F.trunc("APP_START_DT", "MM"))
-    .withColumn("trx_month", F.trunc("TJD", "MM"))
-)
-
-# Step 2: Minimum transaction month per application
-df_min_trx = (
-    joined_df_ana
-    .groupBy("PROD_KEY", "GRIDID", "app_month")
-    .agg(F.min("trx_month").alias("min_trx_date"))
-)
-
-# Step 3: Flag whether borrower has ≥ lag_months history
-df_result = df_min_trx.withColumn(
-    "has_lag_month_history",
-    F.col("min_trx_date").isNotNull() &
-    (F.col("app_month") >= F.add_months(F.col("min_trx_date"), lag_months))
-)
-
-# Step 4: Join back (KEEP ALL applications, no filter here)
-df_with_flag = joined_df_ana.join(
-    F.broadcast(df_result), on=["PROD_KEY", "GRIDID", "app_month"], how="left"
-)
-
-# Step 5: Filter transactions in the last lag_months before app_month
-df_last_12_months = df_with_flag.filter(
-    (F.col("TJD") >= F.add_months(F.col("app_month"), -lag_months)) &
-    (F.col("TJD") <= F.col("app_month"))
-)
-
-# Step 6: Monthly transaction counts
-df_month_counts = (
-    df_last_12_months
-    .groupBy("PROD_KEY", "GRIDID", "app_month", "trx_month", "has_lag_month_history")
-    .agg(
-        F.count("*").alias("monthly_trx_count"),
-        F.sum(F.when(F.col("ITC1") == 1, 1).otherwise(0)).alias("m_credit_trx_count")
-    )
-)
-
-# Step 7: Aggregate at application level
-df_final = (
-    df_month_counts
-    .groupBy("PROD_KEY", "GRIDID", "app_month", "has_lag_month_history")
-    .agg(
-        F.countDistinct("trx_month").alias("active_month"),
-        F.min("monthly_trx_count").alias("min_trx_count_nonzero"),
-        F.sum("m_credit_trx_count").alias("total_credit_trx_count"),
-        F.sum("monthly_trx_count").alias("total_trx_count")
-    )
-    .withColumn(
-        "min_trx_count",
-        F.when(F.col("active_month") == lag_months, F.col("min_trx_count_nonzero"))
-         .otherwise(F.lit(0))
-    )
-    .drop("min_trx_count_nonzero")
-)
-
-# Final output
-df_final.show(truncate=False)
-
-def spark_memory_summary(spark):
-    conf = spark.sparkContext.getConf()
-    
-    # Read config values
-    executor_mem_gb = float(conf.get("spark.executor.memory", "0g").replace("g", ""))
-    driver_mem_gb   = float(conf.get("spark.driver.memory", "0g").replace("g", ""))
-    max_executors   = int(conf.get("spark.dynamicAllocation.maxExecutors", 
-                                   conf.get("spark.executor.instances", "0")))
-    
-    # JVM overhead (default: 10% of executor/driver mem, min 384 MB)
-    executor_overhead = max(0.384, executor_mem_gb * 0.10)
-    driver_overhead   = max(0.384, driver_mem_gb * 0.10)
-    
-    # Totals
-    total_executor_heap    = executor_mem_gb * max_executors
-    total_driver_heap      = driver_mem_gb
-    total_heap             = total_executor_heap + total_driver_heap
-    
-    total_executor_request = (executor_mem_gb + executor_overhead) * max_executors
-    total_driver_request   = driver_mem_gb + driver_overhead
-    total_cluster_request  = total_executor_request + total_driver_request
-    
-    return {
-        "executor_memory_gb": executor_mem_gb,
-        "driver_memory_gb": driver_mem_gb,
-        "max_executors": max_executors,
-        "total_heap_gb": total_heap,
-        "total_cluster_memory_with_overhead_gb": total_cluster_request
-    }
-
-print(spark_memory_summary(spark))
-
-
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.model_selection import GroupKFold
+from feature_engine.selection import DropHighPSIFeatures
 
-# Provided data
-df = pd.DataFrame({
-    "threshold": [1, 1, 1, 1, 2, 2, 2, 2]*3,
-    "application_count": [100, 120, 140, 160, 110, 130, 150, 170]*3,
-    "target_count": [10, 15, 20, 25, 12, 18, 22, 28]*3,
-    "type": ["min_types", "min_types", "total", "total"]*6,
-    "segment": ["main", "any", "combined", "main"]*6
-})
+# # ---------- Simulate data: 10k customers per year, 2019 vs 2020 with drift ----------
+# rng = np.random.default_rng(123)
+# n_per_year = 10_000
 
-# Melt so we can plot both application_count and target_count
-df_melt = df.melt(
-    id_vars=["threshold", "type", "segment"],
-    value_vars=["application_count", "target_count"],
-    var_name="metric",
-    value_name="count"
-)
+# months = np.array([f"{m:02d}" for m in range(1, 13)])
 
-# Get unique segments for plotting
-segments = df_melt['segment'].unique()
+# def make_year(year, n, mean, sd=10):
+#     mlabels = np.tile(months, int(np.ceil(n/12)))[:n]
+#     rng.shuffle(mlabels)
+#     yyyy_mm = [f"{year}-{m}" for m in mlabels]
+#     return pd.DataFrame({
+#         "YYYYMM": yyyy_mm,
+#         "year": year,
+#         "feat1": rng.normal(mean, sd, size=n)
+#     })
 
-fig, axes = plt.subplots(1, len(segments), figsize=(18, 5), sharey=True)
+# df = pd.concat([
+#     make_year(2019, n_per_year, mean=50, sd=10),
+#     make_year(2020, n_per_year, mean=60, sd=10),
+#     #make_year(2021, n_per_year, mean=60, sd=10)
+# ], ignore_index=True)
+import pandas as pd
+import numpy as np
 
-for i, seg in enumerate(segments):
-    ax = axes[i] if len(segments) > 1 else axes
-    data_seg = df_melt[df_melt['segment'] == seg]
-    sns.barplot(
-        data=data_seg,
-        x="threshold",
-        y="count",
-        hue="type",
-        ci=None,
-        palette="Set2",
-        ax=ax
-    )
-    # Overlay application/target as hatch or alpha
-    for metric, hatch in zip(['application_count', 'target_count'], ['', '//']):
-        data_metric = data_seg[data_seg['metric'] == metric]
-        bars = ax.patches
-        for bar, val in zip(bars, data_metric['count']):
-            bar.set_hatch(hatch)
-    ax.set_title(f"Segment: {seg}")
-    ax.set_xlabel("Threshold")
-    if i == 0:
-        ax.set_ylabel("Count")
-    else:
-        ax.set_ylabel("")
-    ax.legend(title="Type")
+# ---------- Simulate data: 10k customers per year, 2019 vs 2020 with drift ----------
+rng = np.random.default_rng(123)
+n_per_year = 10_000
 
-fig.suptitle("Application & Target Counts by Threshold and Type for Each Segment", fontsize=16, y=1.05)
+months = np.array([f"{m:02d}" for m in range(1, 13)])
+
+def make_year(year, n, mean, sd=10):
+    mlabels = np.tile(months, int(np.ceil(n/12)))[:n]
+    rng.shuffle(mlabels)
+    yyyy_mm = [f"{year}-{m}" for m in mlabels]
+    df = pd.DataFrame({
+        "YYYYMM": yyyy_mm,
+        "year": year,
+        "feat1": rng.normal(mean, sd, size=n)
+    })
+    
+    # Add proper datetime column (set day=01 for simplicity)
+    df["date"] = pd.to_datetime(df["YYYYMM"] + "-01")
+    
+    # Add period-based columns
+    df["month"] = df["date"].dt.month
+    df["quarter"] = df["date"].dt.to_period("Q").astype(str)   # e.g., '2019Q1'
+    df["half_year"] = np.where(df["date"].dt.quarter <= 2, "H1", "H2")
+    df["year_half"] = df["year"].astype(str) + df["half_year"]  # e.g., '2019H1'
+    
+    return df
+
+df = pd.concat([
+    make_year(2019, n_per_year, mean=50, sd=10),
+    make_year(2020, n_per_year, mean=60, sd=10),
+
+], ignore_index=True)
+
+
+
+# # Simulate initial full dataset
+# rng = np.random.default_rng(2025)
+
+# def simulate_year(year, n_total, base_mean, base_sd=10.0,
+#                   seasonal_amp=2.0, noise_sd=0.8):
+#     months = np.arange(1, 13)
+#     counts = np.repeat(n_total // 12, 12)
+#     seasonal = seasonal_amp * np.sin(2 * np.pi * (months - 1) / 12.0)
+#     month_means = base_mean + seasonal + rng.normal(0.0, noise_sd, size=12)
+#     rows = []
+#     for m, cnt in zip(months, counts):
+#         vals = rng.normal(loc=month_means[m-1], scale=base_sd, size=cnt)
+#         rows.append(pd.DataFrame({"year": year, "YYYYMM": f"{year}-{m:02d}", "feat1": vals}))
+#     return pd.concat(rows, ignore_index=True)
+
+# # Start with equal monthly counts, then drop randomly to make uneven
+# N_PER_YEAR = 12_000
+# df2019 = simulate_year(2019, N_PER_YEAR, base_mean=50.0, base_sd=10.0)
+# df2020 = simulate_year(2020, N_PER_YEAR, base_mean=55.0, base_sd=10.0)
+
+# def drop_randomly(df, min_frac=0.5, max_frac=0.9):
+#     out = []
+#     for month in df["YYYYMM"].unique():
+#         sub = df[df["YYYYMM"] == month]
+#         frac = rng.uniform(min_frac, max_frac)
+#         out.append(sub.sample(frac=frac, random_state=2025))
+#     return pd.concat(out, ignore_index=True)
+
+# df2019_uneven = drop_randomly(df2019, min_frac=0.5, max_frac=0.9)
+# df2020_uneven = drop_randomly(df2020, min_frac=0.5, max_frac=0.9)
+
+# df = pd.concat([df2019_uneven, df2020_uneven], ignore_index=True)
+
+
+
+# ---------- Pure PSI: 2019 (basis) vs 2020 (test) in both directions ----------
+df_pure = df.copy()
+df_pure["split"] = np.where(df_pure["year"] == 2019, "basis", "test")
+
+dhp_fwd = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency")
+dhp_fwd.fit(df_pure[["feat1", "split"]])
+psi_pure_forward = dhp_fwd.psi_values_["feat1"]
+
+dhp_rev = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency", switch=True)
+dhp_rev.fit(df_pure[["feat1", "split"]])
+psi_pure_reverse = dhp_rev.psi_values_["feat1"]
+
+# ---------- GroupKFold(5) on YYYYMM with forward & reverse per fold ----------
+gkf = GroupKFold(n_splits=5, shuffle=True, random_state=23)
+rows = []
+
+group = "month"
+for fold, (train_idx, test_idx) in enumerate(gkf.split(df, groups=df[group])):
+    tmp = df[["feat1", group]].copy()
+    tmp["split"] = "test"
+    tmp.loc[tmp.index.isin(train_idx), "split"] = "basis"
+    
+    dhp_fold_fwd = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency")
+    dhp_fold_fwd.fit(tmp[["feat1", "split"]])
+    psi_forward = dhp_fold_fwd.psi_values_["feat1"]
+    
+    dhp_fold_rev = DropHighPSIFeatures(split_col="split", bins=10, strategy="equal_frequency", switch=True)
+    dhp_fold_rev.fit(tmp[["feat1", "split"]])
+    psi_reverse = dhp_fold_rev.psi_values_["feat1"]
+    
+    rows.append({"Fold": fold,
+                 "PSI_forward": psi_forward,
+                 "PSI_reverse": psi_reverse})
+
+df_folds = pd.DataFrame(rows).sort_values("Fold").reset_index(drop=True)
+
+
+# ---------- Plot: PSI per fold (forward vs reverse) ----------
+plt.figure()
+x = np.arange(len(df_folds))
+width = 0.35
+plt.bar(x - width/2, df_folds["PSI_forward"], width, label="Forward (refer→test)")
+plt.bar(x + width/2, df_folds["PSI_reverse"], width, label="Reverse (test→refer)")
+plt.xticks(x, [f"Fold {i}" for i in df_folds["Fold"]])
+plt.ylabel("PSI")
+plt.title("PSI per Fold (Forward vs Reverse) — GroupKFold on YYYYMM")
+plt.legend()
 plt.tight_layout()
 plt.show()
 
+# ---------- Also show pure PSI as reference in text ----------
+print(f"Pure PSI 2019→2020 (forward): {psi_pure_forward:.4f}")
+print(f"Pure PSI 2020→2019 (reverse): {psi_pure_reverse:.4f}")
+
+
+# from scipy.stats import ks_2samp
+# ref =df2019_uneven['feat1']
+# act = df2020_uneven['feat1']
+# # Compute KS statistic and p-value
+# ks_stat, ks_pval = ks_2samp(ref, act)
+
+# #tools.display_dataframe_to_user("PSI and KS summary", summary_with_ks)
+
+# # Plot the empirical CDFs to visualize the KS statistic
+# def ecdf(data):
+#     """Compute ECDF for a 1D array of measurements."""
+#     x = np.sort(data)
+#     y = np.arange(1, len(x)+1) / len(x)
+#     return x, y
+
+# x_ref, y_ref = ecdf(ref)
+# x_act, y_act = ecdf(act)
+
+# plt.figure(figsize=(8,6))
+# plt.plot(x_ref, y_ref, label="Reference ECDF")
+# plt.plot(x_act, y_act, label="Actual ECDF")
+# plt.title(f"Empirical CDFs (KS statistic = {ks_stat:.4f}, p={ks_pval:.4e})")
+# plt.xlabel("Value")
+# plt.ylabel("ECDF")
+# plt.legend()
+# plt.grid(True)
+# plt.tight_layout()
+# plt.show()
 
 
 
