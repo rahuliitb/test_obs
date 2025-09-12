@@ -336,4 +336,88 @@ print(f"Pure PSI 2020→2019 (reverse): {psi_pure_reverse:.4f}")
 # plt.show()
 
 
+import pandas as pd
+
+def filter_independent_variable(df, app_col, bad_flag):
+    """
+    Filter applications per application_id by prioritizing 'bad' applications
+    and applying 180-day spacing rule.
+
+    Parameters:
+        df (pd.DataFrame): Input DataFrame with columns [app_col, 'app_start_dt', bad_flag].
+        app_col (str): Column name representing application id (or customer id).
+        bad_flag (str): Column name that indicates bad cases (1 = bad, 0 = good).
+
+    Returns:
+        pd.DataFrame: Filtered DataFrame with selected applications.
+    """
+
+    # Ensure app_start_dt is datetime
+    df["app_start_dt"] = pd.to_datetime(df["app_start_dt"])
+
+    def process_group(k2):
+        """Apply filtering logic to each group (per application_id)."""
+        k2 = k2.drop_duplicates()
+
+        # If only one row in group, return it
+        if len(k2) == 1:
+            return k2
+
+        # Sort applications by start date (latest first)
+        k2 = k2.sort_values("app_start_dt", ascending=False).reset_index(drop=True)
+
+        filter_keep = set()       # Dates to keep
+        filter_discard = set()    # Dates to discard
+
+        # Start with the latest application
+        track_dt = k2.iloc[0].app_start_dt
+        track_bad = k2.iloc[0][bad_flag]
+
+        # Loop through applications
+        for i in range(1, len(k2)):
+            date_diff = (track_dt - k2.iloc[i].app_start_dt).days
+
+            if date_diff > 180:
+                # Applications far apart → keep both
+                filter_keep.add(track_dt)
+                filter_keep.add(k2.iloc[i].app_start_dt)
+                track_dt = k2.iloc[i].app_start_dt
+                track_bad = k2.iloc[i][bad_flag]
+
+            else:
+                # Case 1: both bad
+                if (track_bad == 1) and (k2.iloc[i][bad_flag] == 1):
+                    filter_keep.add(track_dt)
+                    track_dt = k2.iloc[i].app_start_dt
+                    track_bad = 1
+
+                # Case 2: current is bad → prefer it
+                elif k2.iloc[i][bad_flag] == 1:
+                    filter_keep.add(k2.iloc[i].app_start_dt)
+                    track_dt = k2.iloc[i].app_start_dt
+                    track_bad = 1
+
+                    # If previous was within 180 days, discard it
+                    if (k2.iloc[i-1].app_start_dt - k2.iloc[i].app_start_dt).days < 180:
+                        filter_discard.add(k2.iloc[i-1].app_start_dt)
+
+                # Case 3: otherwise → keep tracked one
+                else:
+                    filter_keep.add(track_dt)
+
+        # Always add the last tracked date
+        filter_keep.add(track_dt)
+
+        # Final dates = keep - discard
+        final_dates = list(filter_keep - filter_discard)
+
+        return k2[k2.app_start_dt.isin(final_dates)]
+
+    # Apply filtering per application_id group
+    result = df.groupby(app_col, group_keys=False).apply(process_group)
+
+    return result
+
+
+
 
