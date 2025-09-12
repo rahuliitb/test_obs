@@ -417,6 +417,84 @@ def filter_independent_variable(df, app_col, bad_flag):
     result = df.groupby(app_col, group_keys=False).apply(process_group)
 
     return result
+import pandas as pd
+import pytest
+# from your_module import filter_independent_variable
+
+
+@pytest.mark.parametrize(
+    "df,expected_dates",
+    [
+        # Case 1: Single app → always kept
+        (
+            pd.DataFrame({
+                "application_id": [1],
+                "app_start_dt": ["2024-01-01"],
+                "bad_flag": [0]
+            }),
+            ["2024-01-01"]
+        ),
+
+        # Case 2: Apps >180 days apart → keep both
+        (
+            pd.DataFrame({
+                "application_id": [1, 1],
+                "app_start_dt": ["2024-01-01", "2023-01-01"],
+                "bad_flag": [0, 0]
+            }),
+            ["2024-01-01", "2023-01-01"]
+        ),
+
+        # Case 3: Apps <180 days, both good → keep latest
+        (
+            pd.DataFrame({
+                "application_id": [1, 1],
+                "app_start_dt": ["2024-01-01", "2023-11-01"],
+                "bad_flag": [0, 0]
+            }),
+            ["2024-01-01"]
+        ),
+
+        # Case 4: Apps <180 days, both bad → keep both
+        (
+            pd.DataFrame({
+                "application_id": [1, 1],
+                "app_start_dt": ["2024-01-01", "2023-11-01"],
+                "bad_flag": [1, 1]
+            }),
+            ["2024-01-01", "2023-11-01"]
+        ),
+
+        # Case 5: Apps <180 days, one bad → keep bad one
+        (
+            pd.DataFrame({
+                "application_id": [1, 1],
+                "app_start_dt": ["2024-01-01", "2023-11-01"],
+                "bad_flag": [0, 1]  # latest good, older bad
+            }),
+            ["2023-11-01"]
+        ),
+
+        # Case 6: Mixed scenario
+        (
+            pd.DataFrame({
+                "application_id": [1, 1, 1, 1],
+                "app_start_dt": [
+                    "2024-12-01",  # good
+                    "2024-07-01",  # bad (should override latest good)
+                    "2023-12-01",  # good (>180 days apart)
+                    "2023-05-01"   # bad (>180 days apart)
+                ],
+                "bad_flag": [0, 1, 0, 1]
+            }),
+            ["2024-07-01", "2023-12-01", "2023-05-01"]
+        ),
+    ]
+)
+def test_filter_independent_variable(df, expected_dates):
+    result = filter_independent_variable(df, "application_id", "bad_flag")
+    result_dates = result["app_start_dt"].dt.strftime("%Y-%m-%d").tolist()
+    assert sorted(result_dates) == sorted(expected_dates)
 
 
 
