@@ -36,6 +36,11 @@ def objective(trial):
     # ---------------- AUC (mean & std) ----------------
     valid_auc_mean = cv_results["valid auc-mean"][best_iter]
     valid_auc_std  = cv_results["valid auc-stdv"][best_iter]
+
+
+
+
+
     train_auc_mean = cv_results["train auc-mean"][best_iter]
     train_auc_std  = cv_results["train auc-stdv"][best_iter]
 
@@ -63,3 +68,39 @@ def objective(trial):
 
     # ---------------- Objective to maximize ----------------
     return valid_auc_mean
+
+
+def extract_lightgbm_optuna_results(best_trial):
+    """
+    Extracts key metrics, parameters, and metadata from an Optuna best_trial object
+    and returns them as a clean dictionary.
+    """
+
+    # Separate params and user attributes
+    params = best_trial.params
+    user_attrs = best_trial.user_attrs
+
+    result = {
+        "best_value": best_trial.value,                       # the optimized metric (valid AUC)
+        "best_iteration": user_attrs.get("best_iteration"),
+        
+        # Validation metrics
+        "valid_auc_mean": user_attrs.get("valid_auc_mean"),
+        "valid_auc_std": user_attrs.get("valid_auc_std"),
+        "valid_logloss_mean": user_attrs.get("valid_logloss_mean"),
+        "valid_logloss_std": user_attrs.get("valid_logloss_std"),
+
+        # Training metrics
+        "train_auc_mean": user_attrs.get("train_auc_mean"),
+        "train_auc_std": user_attrs.get("train_auc_std"),
+        "train_logloss_mean": user_attrs.get("train_logloss_mean"),
+        "train_logloss_std": user_attrs.get("train_logloss_std"),
+
+        # Overfitting indicator (optional)
+        "auc_overfit_ratio": user_attrs.get("auc_overfit_ratio"),
+
+        # Hyperparameters used for this trial
+        "hyperparameters": params
+    }
+
+    return result
