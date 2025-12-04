@@ -1,315 +1,65 @@
-import numpy as np
-import pandas as pd
-
-from lightgbm import LGBMClassifier
-from sklearn.model_selection import GroupKFold, RandomizedSearchCV
-from sklearn.metrics import roc_auc_score, average_precision_score, classification_report, confusion_matrix
-from scipy.stats import randint, uniform
-import shap
 import optuna
-import joblib
+import lightgbm as lgb
+import numpy as np
 
-SEED = 42
-np.random.seed(SEED)
+def objective(trial):
 
-# -------------------------------------------------------------------
-# 1. RandomizedSearchCV → find best_params_
-# -------------------------------------------------------------------
-def run_random_search(X, y, groups, n_iter=30, n_splits=5, n_jobs=4):
-    param_dist = {
-        "n_estimators": randint(300, 3000),
-        "num_leaves": randint(20, 200),
-        "max_depth": randint(3, 15),
-        "learning_rate": uniform(0.005, 0.3),
-        "min_child_samples": randint(10, 200),
-        "subsample": uniform(0.5, 0.5),
-        "colsample_bytree": uniform(0.4, 0.6),
-        "reg_alpha": uniform(0.0, 5.0),
-        "reg_lambda": uniform(0.0, 5.0),
-        "boosting_type": ["gbdt", "dart"],
-    }
-
-    base = LGBMClassifier(objective="binary", random_state=SEED, n_jobs=1)
-    gkf = GroupKFold(n_splits=n_splits)
-
-    rs = RandomizedSearchCV(
-        estimator=base,
-        param_distributions=param_dist,
-        n_iter=n_iter,
-        scoring="roc_auc",
-        cv=list(gkf.split(X, y, groups)),
-        n_jobs=n_jobs,
-        verbose=1,
-        random_state=SEED,
-        refit=True,          # fine; we'll still just take best_params_
-    )
-    rs.fit(X, y, groups=groups)
-    return rs
-
-
-# -------------------------------------------------------------------
-# 2. Using ONLY best_params_ → compute SHAP via GroupKFold
-# -------------------------------------------------------------------
-def compute_avg_shap_groupk(X, y, groups, best_params, n_splits=5, early_stopping_rounds=50):
-    """
-    For the single best parameter set:
-      - Run GroupKFold
-      - For each fold: fit model with eval_set, compute SHAP on val
-      - Aggregate average |SHAP| across folds
-    """
-    if not isinstance(X, pd.DataFrame):
-        X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-
-    X_np = X.values
-    y_np = np.array(y)
-    groups_np = np.array(groups)
-
-    gkf = GroupKFold(n_splits=n_splits)
-    feat_names = X.columns.tolist()
-
-    abs_shap_sum = np.zeros(X.shape[1])
-    total_n = 0
-
-    for fold, (tr_idx, val_idx) in enumerate(gkf.split(X_np, y_np, groups_np), 1):
-        X_tr, y_tr = X_np[tr_idx], y_np[tr_idx]
-        X_val, y_val = X_np[val_idx], y_np[val_idx]
-
-        params = best_params.copy()
-        params.update({
-            "objective": "binary",
-            "random_state": SEED,
-            "n_jobs": 1,      # consistent per-fold
-        })
-        model = LGBMClassifier(**params)
-
-        model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-            early_stopping_rounds=early_stopping_rounds,
-            verbose=False
-        )
-
-        explainer = shap.TreeExplainer(model)
-        shap_vals = explainer.shap_values(X_val)
-
-        if isinstance(shap_vals, (list, tuple)):
-            shap_vals = shap_vals[1]   # positive class for binary
-
-        abs_shap_sum += np.abs(shap_vals).sum(axis=0)
-        total_n += X_val.shape[0]
-
-    avg_abs_shap = abs_shap_sum / total_n
-    return pd.Series(avg_abs_shap, index=feat_names).sort_values(ascending=False)
-
-
-# -------------------------------------------------------------------
-# 3. Select features based on 95% cumulative SHAP
-# -------------------------------------------------------------------
-def select_features_from_shap(shap_series, coverage=0.95):
-    norm = shap_series / shap_series.sum()
-    csum = norm.cumsum()
-    selected = csum[csum <= coverage].index.tolist()
-    if not selected:  # in case first feature already > coverage
-        selected = [shap_series.index[0]]
-    return selected
-
-
-# -------------------------------------------------------------------
-# 4. Optuna hyperparameter tuning on selected features (GroupKFold)
-# -------------------------------------------------------------------
-def optuna_tune_lgbm(X, y, groups, n_trials=40, n_splits=5, early_stopping_rounds=50):
-    X_np = X.values
-    y_np = np.array(y)
-    groups_np = np.array(groups)
-
-    def objective(trial):
-        params = {
-            "objective": "binary",
-            "boosting_type": trial.suggest_categorical("boosting_type", ["gbdt", "dart"]),
-            "n_estimators": trial.suggest_int("n_estimators", 300, 3000),
-            "learning_rate": trial.suggest_loguniform("learning_rate", 1e-4, 0.2),
-            "num_leaves": trial.suggest_int("num_leaves", 20, 200),
-            "max_depth": trial.suggest_int("max_depth", 3, 15),
-            "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
-            "reg_alpha": trial.suggest_loguniform("reg_alpha", 1e-8, 10.0),
-            "reg_lambda": trial.suggest_loguniform("reg_lambda", 1e-8, 10.0),
-            "subsample": trial.suggest_uniform("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_uniform("colsample_bytree", 0.3, 1.0),
-            "random_state": SEED,
-            "n_jobs": 1,
-        }
-
-        gkf = GroupKFold(n_splits=n_splits)
-        aucs = []
-
-        for tr_idx, val_idx in gkf.split(X_np, y_np, groups_np):
-            model = LGBMClassifier(**params)
-            model.fit(
-                X_np[tr_idx], y_np[tr_idx],
-                eval_set=[(X_np[val_idx], y_np[val_idx])],
-                eval_metric="auc",
-                early_stopping_rounds=early_stopping_rounds,
-                verbose=False
-            )
-            preds = model.predict_proba(X_np[val_idx])[:, 1]
-            aucs.append(roc_auc_score(y_np[val_idx], preds))
-
-        return float(np.mean(aucs))
-
-    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
-    study.optimize(objective, n_trials=n_trials)
-    return study
-
-
-# -------------------------------------------------------------------
-# 5. Final fit & evaluation
-# -------------------------------------------------------------------
-def evaluate_groupk(model_params, X, y, groups, n_splits=5, early_stopping_rounds=50):
-    X_np = X.values
-    y_np = np.array(y)
-    groups_np = np.array(groups)
-    gkf = GroupKFold(n_splits=n_splits)
-
-    aucs, pr_aucs, accs = [], [], []
-
-    for tr_idx, val_idx in gkf.split(X_np, y_np, groups_np):
-        m = LGBMClassifier(**model_params)
-        m.fit(
-            X_np[tr_idx], y_np[tr_idx],
-            eval_set=[(X_np[val_idx], y_np[val_idx])],
-            eval_metric="auc",
-            early_stopping_rounds=early_stopping_rounds,
-            verbose=False
-        )
-        proba = m.predict_proba(X_np[val_idx])[:, 1]
-        pred = (proba >= 0.5).astype(int)
-
-        aucs.append(roc_auc_score(y_np[val_idx], proba))
-        pr_aucs.append(average_precision_score(y_np[val_idx], proba))
-        accs.append((pred == y_np[val_idx]).mean())
-
-    return {
-        "roc_auc_mean": float(np.mean(aucs)),
-        "pr_auc_mean": float(np.mean(pr_aucs)),
-        "accuracy_mean": float(np.mean(accs)),
-    }
-
-
-# -------------------------------------------------------------------
-# 6. Full pipeline tying everything together
-# -------------------------------------------------------------------
-def full_pipeline(
-    X_train, y_train, groups_train,
-    X_test, y_test,
-    n_iter_random=30,
-    n_splits=5,
-    shap_coverage=0.95,
-    optuna_trials=40,
-    model_path="lgbm_credit_risk.joblib"
-):
-    # Ensure DataFrame
-    if not isinstance(X_train, pd.DataFrame):
-        X_train = pd.DataFrame(X_train, columns=[f"f{i}" for i in range(X_train.shape[1])])
-        X_test = pd.DataFrame(X_test, columns=[f"f{i}" for i in range(X_test.shape[1])])
-
-    print("1) RandomizedSearchCV to get best_params_ ...")
-    rs = run_random_search(X_train, y_train, groups_train, n_iter=n_iter_random, n_splits=n_splits)
-    print("Best CV AUC from RandomizedSearchCV:", rs.best_score_)
-    best_params = rs.best_params_
-    print("Best params:", best_params)
-
-    print("\n2) Compute SHAP using only best_params_ with GroupKFold ...")
-    avg_shap = compute_avg_shap_groupk(X_train, y_train, groups_train, best_params, n_splits=n_splits)
-    print("Top 10 features by avg |SHAP|:\n", avg_shap.head(10))
-
-    print(f"\n3) Select features covering {shap_coverage*100:.1f}% cumulative SHAP ...")
-    selected_features = select_features_from_shap(avg_shap, coverage=shap_coverage)
-    print(f"Selected {len(selected_features)} features out of {X_train.shape[1]}.")
-
-    X_train_sel = X_train[selected_features]
-    X_test_sel = X_test[selected_features]
-
-    print("\n4) Optuna tuning on selected features ...")
-    study = optuna_tune_lgbm(X_train_sel, y_train, groups_train, n_trials=optuna_trials, n_splits=n_splits)
-    print("Optuna best CV AUC:", study.best_value)
-    print("Optuna best params:", study.best_params)
-
-    final_params = study.best_params.copy()
-    final_params.update({
+    params = {
         "objective": "binary",
-        "random_state": SEED,
-        "n_jobs": -1,
-    })
-
-    print("\n5) Evaluate final params with GroupKFold on training set ...")
-    cv_metrics = evaluate_groupk(final_params, X_train_sel, y_train, groups_train, n_splits=n_splits)
-    print("CV metrics:", cv_metrics)
-
-    print("\n6) Fit final model on full training data and evaluate on test set ...")
-    final_model = LGBMClassifier(**final_params)
-    final_model.fit(X_train_sel, y_train, verbose=False)
-
-    y_test_proba = final_model.predict_proba(X_test_sel)[:, 1]
-    y_test_pred = (y_test_proba >= 0.5).astype(int)
-
-    test_roc = roc_auc_score(y_test, y_test_proba)
-    test_pr = average_precision_score(y_test, y_test_proba)
-    print("Test ROC AUC:", test_roc)
-    print("Test PR AUC:", test_pr)
-    print("Classification report:\n", classification_report(y_test, y_test_pred))
-    print("Confusion matrix:\n", confusion_matrix(y_test, y_test_pred))
-
-    joblib.dump(final_model, model_path)
-    print(f"\nFinal model saved to {model_path}")
-
-    return {
-        "random_search": rs,
-        "avg_shap": avg_shap,
-        "selected_features": selected_features,
-        "optuna_study": study,
-        "cv_metrics": cv_metrics,
-        "test_metrics": {
-            "roc_auc": test_roc,
-            "pr_auc": test_pr,
-        },
-        "final_model": final_model,
+        "metric": ["auc", "logloss"],
+        "verbosity": -1,
+        "boosting_type": trial.suggest_categorical("boosting_type", ["gbdt", "dart"]),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 32, 512),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
+        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 200),
+        "seed": 42,
     }
 
-
-# -------------------------------------------------------------------
-# Example usage with synthetic data (replace with your real data)
-# -------------------------------------------------------------------
-if __name__ == "__main__":
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-
-    X, y = make_classification(
-        n_samples=3000,
-        n_features=60,
-        n_informative=20,
-        random_state=SEED
-    )
-    groups = np.random.randint(0, 800, size=X.shape[0])
-
-    idx_tr, idx_te = train_test_split(
-        np.arange(X.shape[0]),
-        test_size=0.2,
-        random_state=SEED,
-        stratify=y
+    cv_results = lgb.cv(
+        params=params,
+        train_set=train_data,        # <- your lgb.Dataset
+        nfold=5,
+        num_boost_round=500,
+        early_stopping_rounds=50,
+        eval_train_metric=True,      # get train metrics too
+        return_cvbooster=True        # so we can use best_iteration
     )
 
-    X_train = pd.DataFrame(X[idx_tr], columns=[f"f{i}" for i in range(X.shape[1])])
-    X_test = pd.DataFrame(X[idx_te], columns=[f"f{i}" for i in range(X.shape[1])])
-    y_train = y[idx_tr]
-    y_test = y[idx_te]
-    groups_train = groups[idx_tr]
+    # cv_results is a dict; cvbooster is stored inside it
+    cvbooster = cv_results["cvbooster"]
 
-    results = full_pipeline(
-        X_train, y_train, groups_train,
-        X_test, y_test,
-        n_iter_random=20,      # adjust for speed vs quality
-        n_splits=5,
-        shap_coverage=0.95,
-        optuna_trials=30,      # adjust as per compute
-    )
+    # Best iteration chosen by LightGBM CV (based on your metrics + early stopping)
+    best_iter = cvbooster.best_iteration
+
+    # ---------------- AUC (mean & std) ----------------
+    valid_auc_mean = cv_results["valid auc-mean"][best_iter]
+    valid_auc_std  = cv_results["valid auc-stdv"][best_iter]
+    train_auc_mean = cv_results["train auc-mean"][best_iter]
+    train_auc_std  = cv_results["train auc-stdv"][best_iter]
+
+    # ---------------- Logloss (mean & std) ----------------
+    valid_logloss_mean = cv_results["valid logloss-mean"][best_iter]
+    valid_logloss_std  = cv_results["valid logloss-stdv"][best_iter]
+    train_logloss_mean = cv_results["train logloss-mean"][best_iter]
+    train_logloss_std  = cv_results["train logloss-stdv"][best_iter]
+
+    # ---------------- Store everything on the trial ----------------
+    trial.set_user_attr("best_iteration", best_iter)
+
+    trial.set_user_attr("valid_auc_mean", valid_auc_mean)
+    trial.set_user_attr("valid_auc_std",  valid_auc_std)
+    trial.set_user_attr("train_auc_mean", train_auc_mean)
+    trial.set_user_attr("train_auc_std",  train_auc_std)
+
+    trial.set_user_attr("valid_logloss_mean", valid_logloss_mean)
+    trial.set_user_attr("valid_logloss_std",  valid_logloss_std)
+    trial.set_user_attr("train_logloss_mean", train_logloss_mean)
+    trial.set_user_attr("train_logloss_std",  train_logloss_std)
+
+    # You can also store an overfitting indicator if you like:
+    trial.set_user_attr("auc_overfit_ratio", train_auc_mean / valid_auc_mean)
+
+    # ---------------- Objective to maximize ----------------
+    return valid_auc_mean
