@@ -1,106 +1,13 @@
-import optuna
-import lightgbm as lgb
-import numpy as np
-
-def objective(trial):
-
-    params = {
-        "objective": "binary",
-        "metric": ["auc", "logloss"],
-        "verbosity": -1,
-        "boosting_type": trial.suggest_categorical("boosting_type", ["gbdt", "dart"]),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 32, 512),
-        "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0),
-        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0),
-        "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 20, 200),
-        "seed": 42,
-    }
-
-    cv_results = lgb.cv(
-        params=params,
-        train_set=train_data,        # <- your lgb.Dataset
-        nfold=5,
-        num_boost_round=500,
-        early_stopping_rounds=50,
-        eval_train_metric=True,      # get train metrics too
-        return_cvbooster=True        # so we can use best_iteration
-    )
-
-    # cv_results is a dict; cvbooster is stored inside it
-    cvbooster = cv_results["cvbooster"]
-
-    # Best iteration chosen by LightGBM CV (based on your metrics + early stopping)
-    best_iter = cvbooster.best_iteration
-
-    # ---------------- AUC (mean & std) ----------------
-    valid_auc_mean = cv_results["valid auc-mean"][best_iter]
-    valid_auc_std  = cv_results["valid auc-stdv"][best_iter]
-
-
-
-
-
-    train_auc_mean = cv_results["train auc-mean"][best_iter]
-    train_auc_std  = cv_results["train auc-stdv"][best_iter]
-
-    # ---------------- Logloss (mean & std) ----------------
-    valid_logloss_mean = cv_results["valid logloss-mean"][best_iter]
-    valid_logloss_std  = cv_results["valid logloss-stdv"][best_iter]
-    train_logloss_mean = cv_results["train logloss-mean"][best_iter]
-    train_logloss_std  = cv_results["train logloss-stdv"][best_iter]
-
-    # ---------------- Store everything on the trial ----------------
-    trial.set_user_attr("best_iteration", best_iter)
-
-    trial.set_user_attr("valid_auc_mean", valid_auc_mean)
-    trial.set_user_attr("valid_auc_std",  valid_auc_std)
-    trial.set_user_attr("train_auc_mean", train_auc_mean)
-    trial.set_user_attr("train_auc_std",  train_auc_std)
-
-    trial.set_user_attr("valid_logloss_mean", valid_logloss_mean)
-    trial.set_user_attr("valid_logloss_std",  valid_logloss_std)
-    trial.set_user_attr("train_logloss_mean", train_logloss_mean)
-    trial.set_user_attr("train_logloss_std",  train_logloss_std)
-
-    # You can also store an overfitting indicator if you like:
-    trial.set_user_attr("auc_overfit_ratio", train_auc_mean / valid_auc_mean)
-
-    # ---------------- Objective to maximize ----------------
-    return valid_auc_mean
-
-
-def extract_lightgbm_optuna_results(best_trial):
-    """
-    Extracts key metrics, parameters, and metadata from an Optuna best_trial object
-    and returns them as a clean dictionary.
-    """
-
-    # Separate params and user attributes
-    params = best_trial.params
-    user_attrs = best_trial.user_attrs
-
-    result = {
-        "best_value": best_trial.value,                       # the optimized metric (valid AUC)
-        "best_iteration": user_attrs.get("best_iteration"),
-        
-        # Validation metrics
-        "valid_auc_mean": user_attrs.get("valid_auc_mean"),
-        "valid_auc_std": user_attrs.get("valid_auc_std"),
-        "valid_logloss_mean": user_attrs.get("valid_logloss_mean"),
-        "valid_logloss_std": user_attrs.get("valid_logloss_std"),
-
-        # Training metrics
-        "train_auc_mean": user_attrs.get("train_auc_mean"),
-        "train_auc_std": user_attrs.get("train_auc_std"),
-        "train_logloss_mean": user_attrs.get("train_logloss_mean"),
-        "train_logloss_std": user_attrs.get("train_logloss_std"),
-
-        # Overfitting indicator (optional)
-        "auc_overfit_ratio": user_attrs.get("auc_overfit_ratio"),
-
-        # Hyperparameters used for this trial
-        "hyperparameters": params
-    }
-
-    return result
+def map_lightgbm_native_to_sklearn(params_cv):
+    mapped = params_cv.copy()
+    if "min_data_in_leaf" in params_cv:
+        mapped["min_child_samples"] = params_cv["min_data_in_leaf"]
+    if "min_sum_hessian_in_leaf" in params_cv:
+        mapped["min_child_weight"] = params_cv["min_sum_hessian_in_leaf"]
+    if "bagging_fraction" in params_cv:
+        mapped["subsample"] = params_cv["bagging_fraction"]
+    if "feature_fraction" in params_cv:
+        mapped["colsample_bytree"] = params_cv["feature_fraction"]
+    if "num_boost_round" in params_cv:
+        mapped["n_estimators"] = params_cv["num_boost_round"]
+    return mapped
