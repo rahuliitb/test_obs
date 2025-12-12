@@ -1,4 +1,5 @@
 from typing import List, Optional
+import sys
 import numpy as np
 import pandas as pd
 from optbinning import BinningProcess
@@ -8,7 +9,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import roc_auc_score
 import joblib
-import warnings
+from loguru import logger
 
 
 class ChallengerModel:
@@ -17,6 +18,7 @@ class ChallengerModel:
       - IV filtering using BinningProcess.summary()
       - Final pipeline: BinningProcess(selected_features) -> StandardScaler -> LogisticRegression
       - Hyperparameter tuning using GridSearchCV (supports GroupKFold)
+      - Logging via loguru (info level only)
     """
 
     def __init__(
@@ -31,6 +33,12 @@ class ChallengerModel:
         param_grid: Optional[dict] = None,
         random_state: int = 42,
     ):
+        # configure a default sink if no other configuration is provided by the app
+        # This will send logs to stderr. Users can configure logger elsewhere if needed.
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
+
+        logger.info("Initializing ChallengerModel")
         self.numeric_cols = numeric_cols
         self.target_col = target_col
         self.iv_threshold = iv_threshold
@@ -53,10 +61,16 @@ class ChallengerModel:
         self.final_model_ = None
         self.random_state = random_state
 
+        logger.info(
+            f"numeric_cols={len(self.numeric_cols)} columns, target={self.target_col}, "
+            f"iv_threshold={self.iv_threshold}, min_features={self.min_features}"
+        )
+
     # ------------------------------------------------------------------
     # 1) Compute IV using BinningProcess.summary()
     # ------------------------------------------------------------------
     def compute_iv_report(self, df: pd.DataFrame):
+        logger.info("Starting IV computation using BinningProcess.summary()")
         X, y = df[self.numeric_cols], df[self.target_col].values
 
         # initial binning process for IV computation
@@ -73,6 +87,8 @@ class ChallengerModel:
         summary_df = summary[["variable", "iv"]].sort_values("iv", ascending=False)
 
         self.iv_report_ = summary_df.reset_index(drop=True)
+        logger.info(f"IV computation finished: {len(self.iv_report_)} variables evaluated")
+        logger.info(f"Top IVs (up to 10): {self.iv_report_.head(10).to_dict(orient='records')}")
         return self.iv_report_
 
     # ------------------------------------------------------------------
@@ -80,24 +96,30 @@ class ChallengerModel:
     # ------------------------------------------------------------------
     def select_features(self):
         if self.iv_report_ is None:
+            logger.info("select_features called before compute_iv_report")
             raise RuntimeError("Compute IV report first.")
 
         selected = self.iv_report_[self.iv_report_.iv >= self.iv_threshold]["variable"].tolist()
+        logger.info(f"{len(selected)} features passed IV threshold {self.iv_threshold}")
 
         if len(selected) < self.min_features:
-            warnings.warn(
+            logger.info(
                 f"Only {len(selected)} features passed IV threshold {self.iv_threshold}. "
                 f"Selecting top {self.min_features} instead."
             )
             selected = self.iv_report_.head(self.min_features)["variable"].tolist()
 
         self.selected_features_ = selected
+        logger.info(f"Selected {len(self.selected_features_)} features: {self.selected_features_}")
         return selected
 
     # ------------------------------------------------------------------
     # Build pipeline for selected features
     # ------------------------------------------------------------------
     def _build_pipeline(self):
+        logger.info("Building pipeline for selected features")
+        logger.info(f"Selected features for pipeline: {self.selected_features_}")
+
         binning = BinningProcess(
             variable_names=self.selected_features_,
             special_codes=self.special_codes,
@@ -112,6 +134,7 @@ class ChallengerModel:
             ("scaler", scaler),
             ("clf", clf)
         ])
+        logger.info("Pipeline constructed successfully")
         return pipe
 
     # ------------------------------------------------------------------
@@ -126,6 +149,7 @@ class ChallengerModel:
         n_jobs: int = -1,
         save_path: Optional[str] = None
     ):
+        logger.info("Starting model fit procedure")
         # Step 1: compute IV
         self.compute_iv_report(df)
 
@@ -139,6 +163,9 @@ class ChallengerModel:
         y = df[self.target_col].values
 
         # Step 4: Hyperparameter tuning
+        logger.info(
+            f"Starting GridSearchCV with scoring={self.scoring}, n_jobs={n_jobs}, verbose={verbose}"
+        )
         gs = GridSearchCV(
             estimator=pipe,
             param_grid=self.param_grid,
@@ -150,8 +177,10 @@ class ChallengerModel:
         )
 
         if groups is not None:
+            logger.info("Fitting GridSearchCV with groups provided")
             gs.fit(X, y, groups=groups)
         else:
+            logger.info("Fitting GridSearchCV without groups")
             gs.fit(X, y)
 
         # Step 5: Save results
@@ -159,12 +188,20 @@ class ChallengerModel:
         self.best_params_ = gs.best_params_
         self.best_cv_score_ = gs.best_score_
 
+        logger.info(f"GridSearchCV finished. Best CV score: {self.best_cv_score_}")
+        logger.info(f"Best parameters: {self.best_params_}")
+
         # Train score for refitted best model
         proba = self.final_model_.predict_proba(X)[:, 1]
         self.train_score_ = roc_auc_score(y, proba)
+        logger.info(f"Train ROC AUC (refit on full training set): {self.train_score_}")
 
         if save_path:
-            joblib.dump(self, save_path)
+            try:
+                joblib.dump(self, save_path)
+                logger.info(f"Saved ChallengerModel to {save_path}")
+            except Exception as e:
+                logger.info(f"Failed to save model to {save_path}: {e}")
 
         return self
 
@@ -172,10 +209,15 @@ class ChallengerModel:
     # Prediction APIs
     # ------------------------------------------------------------------
     def predict(self, X: pd.DataFrame):
+        logger.info("predict called")
         X = X[self.selected_features_]
-        return self.final_model_.predict(X)
+        preds = self.final_model_.predict(X)
+        logger.info(f"predict produced {len(preds)} predictions")
+        return preds
 
     def predict_proba(self, X: pd.DataFrame):
+        logger.info("predict_proba called")
         X = X[self.selected_features_]
-        return self.final_model_.predict_proba(X)
-
+        proba = self.final_model_.predict_proba(X)
+        logger.info(f"predict_proba produced probabilities with shape {proba.shape}")
+        return proba
