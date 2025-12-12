@@ -1,60 +1,181 @@
+from typing import List, Optional
 import numpy as np
-from sklearn.datasets import load_breast_cancer
+import pandas as pd
+from optbinning import BinningProcess
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import roc_auc_score
-from lightgbm import LGBMClassifier
-import lightgbm as lgb
+import joblib
+import warnings
 
-X, y = load_breast_cancer(return_X_y=True)
-train_idx = np.arange(len(y))
-# simple train / eval split
-split = int(len(y) * 0.8)
-tr_idx, va_idx = train_idx[:split], train_idx[split:]
-X_tr, X_va = X[tr_idx], X[va_idx]
-y_tr, y_va = y[tr_idx], y[va_idx]
 
-params = {
-    "objective": "binary",
-    "metric": "binary_logloss",
-    "learning_rate": 0.05,
-    "num_leaves": 64,
-    "feature_fraction": 0.7,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 5,
-    "bosting_type": "goss",
-    "data_sample_strategy": "gradient_based",
-    
-    # "feature_fraction_seed": 42,
-    # "bagging_seed": 42,
-    # "data_random_seed": 42,
-    "random_state": 42,
-    "n_jobs": 1,
-    "verbosity": -1
-}
+class ChallengerModel:
+    """
+    ChallengerModel with:
+      - IV filtering using BinningProcess.summary()
+      - Final pipeline: BinningProcess(selected_features) -> StandardScaler -> LogisticRegression
+      - Hyperparameter tuning using GridSearchCV (supports GroupKFold)
+    """
 
-# 1) sklearn wrapper
-clf = LGBMClassifier(**params, n_estimators=1000)
-clf.fit(
-    X_tr, y_tr,
-    eval_set=[(X_va, y_va)],
-    eval_metric="binary_logloss",
-    callbacks=[early_stopping(stopping_rounds=50)]
-)
+    def __init__(
+        self,
+        numeric_cols: List[str],
+        target_col: str,
+        iv_threshold: float = 0.02,
+        min_features: int = 5,
+        special_codes: Optional[List[int]] = None,
+        scoring: str = "roc_auc",
+        binning_fit_params: Optional[dict] = None,
+        param_grid: Optional[dict] = None,
+        random_state: int = 42,
+    ):
+        self.numeric_cols = numeric_cols
+        self.target_col = target_col
+        self.iv_threshold = iv_threshold
+        self.min_features = min_features
+        self.special_codes = special_codes or [-9, -8, -7]
+        self.scoring = scoring
+        self.binning_fit_params = binning_fit_params or {}
 
-pred1 = clf.predict_proba(X_va, num_iteration=clf.best_iteration_)[:,1]
+        self.param_grid = param_grid or {
+            "clf__C": [0.01, 0.1, 1.0, 10.0],
+            "clf__class_weight": [None, "balanced"],
+        }
 
-# 2) native API
-dtrain = lgb.Dataset(X_tr, label=y_tr)
-dval = lgb.Dataset(X_va, label=y_va, reference=dtrain)
-# copy params but remove n_jobs (native uses num_threads)
-native_params = params.copy()
-native_params.pop("n_jobs", None)
-native_params["metric"] = "binary_logloss"
-bst = lgb.train(native_params, dtrain, num_boost_round=1000,
-                valid_sets=[dval], 
-                callbacks=[early_stopping(stopping_rounds=50)]
-                )
-pred2 = bst.predict(X_va, num_iteration=bst.best_iteration)
+        # Results
+        self.iv_report_ = None
+        self.selected_features_ = None
+        self.best_params_ = None
+        self.best_cv_score_ = None
+        self.train_score_ = None
+        self.final_model_ = None
+        self.random_state = random_state
 
-print("AUC wrapper:", roc_auc_score(y_va, pred1))
-print("AUC native:", roc_auc_score(y_va, pred2))
-print("Max abs prediction diff:", float(np.max(np.abs(pred1 - pred2))))
+    # ------------------------------------------------------------------
+    # 1) Compute IV using BinningProcess.summary()
+    # ------------------------------------------------------------------
+    def compute_iv_report(self, df: pd.DataFrame):
+        X, y = df[self.numeric_cols], df[self.target_col].values
+
+        # initial binning process for IV computation
+        bp = BinningProcess(
+            variable_names=self.numeric_cols,
+            special_codes=self.special_codes,
+            binning_fit_params=self.binning_fit_params
+        )
+
+        bp.fit(X, y)
+
+        # This summary contains IV and other stats
+        summary = bp.summary()
+        summary_df = summary[["variable", "iv"]].sort_values("iv", ascending=False)
+
+        self.iv_report_ = summary_df.reset_index(drop=True)
+        return self.iv_report_
+
+    # ------------------------------------------------------------------
+    # 2) Select features by IV
+    # ------------------------------------------------------------------
+    def select_features(self):
+        if self.iv_report_ is None:
+            raise RuntimeError("Compute IV report first.")
+
+        selected = self.iv_report_[self.iv_report_.iv >= self.iv_threshold]["variable"].tolist()
+
+        if len(selected) < self.min_features:
+            warnings.warn(
+                f"Only {len(selected)} features passed IV threshold {self.iv_threshold}. "
+                f"Selecting top {self.min_features} instead."
+            )
+            selected = self.iv_report_.head(self.min_features)["variable"].tolist()
+
+        self.selected_features_ = selected
+        return selected
+
+    # ------------------------------------------------------------------
+    # Build pipeline for selected features
+    # ------------------------------------------------------------------
+    def _build_pipeline(self):
+        binning = BinningProcess(
+            variable_names=self.selected_features_,
+            special_codes=self.special_codes,
+            binning_fit_params=self.binning_fit_params,
+        )
+
+        scaler = StandardScaler()
+        clf = LogisticRegression(max_iter=2000, random_state=self.random_state)
+
+        pipe = Pipeline([
+            ("binning", binning),
+            ("scaler", scaler),
+            ("clf", clf)
+        ])
+        return pipe
+
+    # ------------------------------------------------------------------
+    # 3) Fit Challenger Model with CV & hyperparameter tuning
+    # ------------------------------------------------------------------
+    def fit(
+        self,
+        df: pd.DataFrame,
+        cv,
+        groups=None,
+        verbose: int = 1,
+        n_jobs: int = -1,
+        save_path: Optional[str] = None
+    ):
+        # Step 1: compute IV
+        self.compute_iv_report(df)
+
+        # Step 2: select features
+        self.select_features()
+
+        # Step 3: build pipeline for selected features
+        pipe = self._build_pipeline()
+
+        X = df[self.selected_features_]
+        y = df[self.target_col].values
+
+        # Step 4: Hyperparameter tuning
+        gs = GridSearchCV(
+            estimator=pipe,
+            param_grid=self.param_grid,
+            scoring=self.scoring,
+            cv=cv,
+            refit=True,
+            n_jobs=n_jobs,
+            verbose=verbose
+        )
+
+        if groups is not None:
+            gs.fit(X, y, groups=groups)
+        else:
+            gs.fit(X, y)
+
+        # Step 5: Save results
+        self.final_model_ = gs.best_estimator_
+        self.best_params_ = gs.best_params_
+        self.best_cv_score_ = gs.best_score_
+
+        # Train score for refitted best model
+        proba = self.final_model_.predict_proba(X)[:, 1]
+        self.train_score_ = roc_auc_score(y, proba)
+
+        if save_path:
+            joblib.dump(self, save_path)
+
+        return self
+
+    # ------------------------------------------------------------------
+    # Prediction APIs
+    # ------------------------------------------------------------------
+    def predict(self, X: pd.DataFrame):
+        X = X[self.selected_features_]
+        return self.final_model_.predict(X)
+
+    def predict_proba(self, X: pd.DataFrame):
+        X = X[self.selected_features_]
+        return self.final_model_.predict_proba(X)
+
