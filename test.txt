@@ -1,13 +1,60 @@
-def map_lightgbm_native_to_sklearn(params_cv):
-    mapped = params_cv.copy()
-    if "min_data_in_leaf" in params_cv:
-        mapped["min_child_samples"] = params_cv["min_data_in_leaf"]
-    if "min_sum_hessian_in_leaf" in params_cv:
-        mapped["min_child_weight"] = params_cv["min_sum_hessian_in_leaf"]
-    if "bagging_fraction" in params_cv:
-        mapped["subsample"] = params_cv["bagging_fraction"]
-    if "feature_fraction" in params_cv:
-        mapped["colsample_bytree"] = params_cv["feature_fraction"]
-    if "num_boost_round" in params_cv:
-        mapped["n_estimators"] = params_cv["num_boost_round"]
-    return mapped
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.metrics import roc_auc_score
+from lightgbm import LGBMClassifier
+import lightgbm as lgb
+
+X, y = load_breast_cancer(return_X_y=True)
+train_idx = np.arange(len(y))
+# simple train / eval split
+split = int(len(y) * 0.8)
+tr_idx, va_idx = train_idx[:split], train_idx[split:]
+X_tr, X_va = X[tr_idx], X[va_idx]
+y_tr, y_va = y[tr_idx], y[va_idx]
+
+params = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.05,
+    "num_leaves": 64,
+    "feature_fraction": 0.7,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "bosting_type": "goss",
+    "data_sample_strategy": "gradient_based",
+    
+    # "feature_fraction_seed": 42,
+    # "bagging_seed": 42,
+    # "data_random_seed": 42,
+    "random_state": 42,
+    "n_jobs": 1,
+    "verbosity": -1
+}
+
+# 1) sklearn wrapper
+clf = LGBMClassifier(**params, n_estimators=1000)
+clf.fit(
+    X_tr, y_tr,
+    eval_set=[(X_va, y_va)],
+    eval_metric="binary_logloss",
+    callbacks=[early_stopping(stopping_rounds=50)]
+)
+
+pred1 = clf.predict_proba(X_va, num_iteration=clf.best_iteration_)[:,1]
+
+# 2) native API
+dtrain = lgb.Dataset(X_tr, label=y_tr)
+dval = lgb.Dataset(X_va, label=y_va, reference=dtrain)
+# copy params but remove n_jobs (native uses num_threads)
+native_params = params.copy()
+native_params.pop("n_jobs", None)
+native_params["metric"] = "binary_logloss"
+bst = lgb.train(native_params, dtrain, num_boost_round=1000,
+                valid_sets=[dval], 
+                callbacks=[early_stopping(stopping_rounds=50)]
+                )
+pred2 = bst.predict(X_va, num_iteration=bst.best_iteration)
+
+print("AUC wrapper:", roc_auc_score(y_va, pred1))
+print("AUC native:", roc_auc_score(y_va, pred2))
+print("Max abs prediction diff:", float(np.max(np.abs(pred1 - pred2))))
