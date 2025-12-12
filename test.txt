@@ -40,3 +40,60 @@ strict_binning_params = {
     "n_jobs": 1,                       # Single-threaded deterministic execution (recommended for reproducibility).
     "verbose": False                   # Set True to inspect binning decisions and merging behavior.
 }
+
+
+
+
+# Build pipeline for selected features
+    # ------------------------
+    def _build_pipeline(self):
+        if self.selected_features_ is None:
+            raise RuntimeError("Call select_features() before building pipeline.")
+
+        binning = BinningProcess(
+            variable_names=self.selected_features_,
+            special_codes=self.special_codes,
+            binning_fit_params=self.binning_fit_params
+        )
+        scaler = StandardScaler()
+
+        # Choose solver based on regularization options
+        if self.regularization == "both":
+            # saga supports l1 and l2 (and is robust for large sparse data)
+            solver = "saga"
+        else:
+            # default solver for l2
+            solver = "lbfgs"
+
+        clf = LogisticRegression(
+            max_iter=2000,
+            random_state=self.random_state,
+            solver=solver
+        )
+
+        pipe = Pipeline([("binning", binning), ("scaler", scaler), ("clf", clf)])
+        return pipe
+
+    # ------------------------
+    # Construct default param grid (adapts to regularization choice)
+    # ------------------------
+    def _build_param_grid(self) -> Dict[str, Any]:
+        if self._user_param_grid is not None:
+            return self._user_param_grid
+
+        # base grid: tune C (inverse regularization strength)
+        base_grid = {
+            "clf__C": [0.001, 0.01, 0.1, 1.0, 10.0]
+        }
+
+        if self.regularization == "both":
+            # allow both penalties
+            base_grid["clf__penalty"] = ["l1", "l2"]
+            # saga supports penalty l1 and l2; if using saga, solver ok
+            # optionally keep class_weight tuning
+            base_grid["clf__class_weight"] = [None, "balanced"]
+        else:
+            # only l2: no penalty hyperparameter needed (solver default 'lbfgs' supports l2)
+            base_grid["clf__class_weight"] = [None, "balanced"]
+
+        return base_grid
