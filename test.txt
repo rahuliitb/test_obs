@@ -1,223 +1,42 @@
-from typing import List, Optional
-import sys
-import numpy as np
-import pandas as pd
-from optbinning import BinningProcess
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import roc_auc_score
-import joblib
-from loguru import logger
+strict_binning_params = {
+    "variable_names": None,            # List of features to bin. MUST be set before initializing BinningProcess.
 
+    "max_n_prebins": 10,               # Max pre-bins before optimization. Lower = smoother, less overfitting.
+    "min_prebin_size": 0.08,           # Each pre-bin must contain ≥ 8% of samples → stable grouping.
 
-class ChallengerModel:
-    """
-    ChallengerModel with:
-      - IV filtering using BinningProcess.summary()
-      - Final pipeline: BinningProcess(selected_features) -> StandardScaler -> LogisticRegression
-      - Hyperparameter tuning using GridSearchCV (supports GroupKFold)
-      - Logging via loguru (info level only)
-    """
+    "min_n_bins": 2,                   # Final bins must be at least 2 (prevents trivial single-bin cases).
+    "max_n_bins": 5,                   # Caps total bins → prevents overly granular splits that overfit.
 
-    def __init__(
-        self,
-        numeric_cols: List[str],
-        target_col: str,
-        iv_threshold: float = 0.02,
-        min_features: int = 5,
-        special_codes: Optional[List[int]] = None,
-        scoring: str = "roc_auc",
-        binning_fit_params: Optional[dict] = None,
-        param_grid: Optional[dict] = None,
-        random_state: int = 42,
-    ):
-        # configure a default sink if no other configuration is provided by the app
-        # This will send logs to stderr. Users can configure logger elsewhere if needed.
-        logger.remove()
-        logger.add(sys.stderr, level="INFO")
+    "min_bin_size": 0.05,              # Each final bin must contain ≥ 5% samples → avoids tiny, unstable bins.
+    "max_bin_size": 0.5,               # Upper bound on bin size → prevents overly dominant bins.
 
-        logger.info("Initializing ChallengerModel")
-        self.numeric_cols = numeric_cols
-        self.target_col = target_col
-        self.iv_threshold = iv_threshold
-        self.min_features = min_features
-        self.special_codes = special_codes or [-9, -8, -7]
-        self.scoring = scoring
-        self.binning_fit_params = binning_fit_params or {}
+    "max_pvalue": 0.05,                # Adjacent bins must differ statistically (p ≤ 0.05). Merges weak splits.
+    "max_pvalue_policy": "consecutive",# Only compare consecutive bins for p-value test; stable & efficient.
 
-        self.param_grid = param_grid or {
-            "clf__C": [0.01, 0.1, 1.0, 10.0],
-            "clf__class_weight": [None, "balanced"],
+    # Variable selection to avoid weak predictors.
+    "selection_criteria": {
+        "iv": {                        # Information Value (IV) filter:
+            "min": 0.02,               # Keep only variables with IV ≥ 0.02 (weak but meaningful).
+            "strategy": "highest",     # Rank variables by highest IV.
+            "top": 0.40                # Keep top 40% IV variables → strong dimensionality reduction.
+        },
+        "ks": {                        # Kolmogorov–Smirnov statistic filter:
+            "min": 0.05                # KS ≥ 0.05 ensures separation between good/bad distributions.
         }
+    },
 
-        # Results
-        self.iv_report_ = None
-        self.selected_features_ = None
-        self.best_params_ = None
-        self.best_cv_score_ = None
-        self.train_score_ = None
-        self.final_model_ = None
-        self.random_state = random_state
+    "fixed_variables": None,           # Variables that must be kept regardless of selection_criteria.
 
-        logger.info(
-            f"numeric_cols={len(self.numeric_cols)} columns, target={self.target_col}, "
-            f"iv_threshold={self.iv_threshold}, min_features={self.min_features}"
-        )
+    "categorical_variables": None,     # Variables treated as categorical (numeric but nominal). Used in binning.
 
-    # ------------------------------------------------------------------
-    # 1) Compute IV using BinningProcess.summary()
-    # ------------------------------------------------------------------
-    def compute_iv_report(self, df: pd.DataFrame):
-        logger.info("Starting IV computation using BinningProcess.summary()")
-        X, y = df[self.numeric_cols], df[self.target_col].values
+    "special_codes": None,             # Values treated separately (e.g., -999 for missing codes).
 
-        # initial binning process for IV computation
-        bp = BinningProcess(
-            variable_names=self.numeric_cols,
-            special_codes=self.special_codes,
-            binning_fit_params=self.binning_fit_params
-        )
+    "split_digits": 3,                 # Round final split points to 3 significant digits → stable & interpretable.
 
-        bp.fit(X, y)
+    # Per-variable overrides:
+    "binning_fit_params": None,        # Dict: {"var1": {"max_n_bins": 4, ...}} custom fit rules per variable.
+    "binning_transform_params": None,  # Dict: {"var1": {"metric": "event_rate"}} custom transform per variable.
 
-        # This summary contains IV and other stats
-        summary = bp.summary()
-        summary_df = summary[["variable", "iv"]].sort_values("iv", ascending=False)
-
-        self.iv_report_ = summary_df.reset_index(drop=True)
-        logger.info(f"IV computation finished: {len(self.iv_report_)} variables evaluated")
-        logger.info(f"Top IVs (up to 10): {self.iv_report_.head(10).to_dict(orient='records')}")
-        return self.iv_report_
-
-    # ------------------------------------------------------------------
-    # 2) Select features by IV
-    # ------------------------------------------------------------------
-    def select_features(self):
-        if self.iv_report_ is None:
-            logger.info("select_features called before compute_iv_report")
-            raise RuntimeError("Compute IV report first.")
-
-        selected = self.iv_report_[self.iv_report_.iv >= self.iv_threshold]["variable"].tolist()
-        logger.info(f"{len(selected)} features passed IV threshold {self.iv_threshold}")
-
-        if len(selected) < self.min_features:
-            logger.info(
-                f"Only {len(selected)} features passed IV threshold {self.iv_threshold}. "
-                f"Selecting top {self.min_features} instead."
-            )
-            selected = self.iv_report_.head(self.min_features)["variable"].tolist()
-
-        self.selected_features_ = selected
-        logger.info(f"Selected {len(self.selected_features_)} features: {self.selected_features_}")
-        return selected
-
-    # ------------------------------------------------------------------
-    # Build pipeline for selected features
-    # ------------------------------------------------------------------
-    def _build_pipeline(self):
-        logger.info("Building pipeline for selected features")
-        logger.info(f"Selected features for pipeline: {self.selected_features_}")
-
-        binning = BinningProcess(
-            variable_names=self.selected_features_,
-            special_codes=self.special_codes,
-            binning_fit_params=self.binning_fit_params,
-        )
-
-        scaler = StandardScaler()
-        clf = LogisticRegression(max_iter=2000, random_state=self.random_state)
-
-        pipe = Pipeline([
-            ("binning", binning),
-            ("scaler", scaler),
-            ("clf", clf)
-        ])
-        logger.info("Pipeline constructed successfully")
-        return pipe
-
-    # ------------------------------------------------------------------
-    # 3) Fit Challenger Model with CV & hyperparameter tuning
-    # ------------------------------------------------------------------
-    def fit(
-        self,
-        df: pd.DataFrame,
-        cv,
-        groups=None,
-        verbose: int = 1,
-        n_jobs: int = -1,
-        save_path: Optional[str] = None
-    ):
-        logger.info("Starting model fit procedure")
-        # Step 1: compute IV
-        self.compute_iv_report(df)
-
-        # Step 2: select features
-        self.select_features()
-
-        # Step 3: build pipeline for selected features
-        pipe = self._build_pipeline()
-
-        X = df[self.selected_features_]
-        y = df[self.target_col].values
-
-        # Step 4: Hyperparameter tuning
-        logger.info(
-            f"Starting GridSearchCV with scoring={self.scoring}, n_jobs={n_jobs}, verbose={verbose}"
-        )
-        gs = GridSearchCV(
-            estimator=pipe,
-            param_grid=self.param_grid,
-            scoring=self.scoring,
-            cv=cv,
-            refit=True,
-            n_jobs=n_jobs,
-            verbose=verbose
-        )
-
-        if groups is not None:
-            logger.info("Fitting GridSearchCV with groups provided")
-            gs.fit(X, y, groups=groups)
-        else:
-            logger.info("Fitting GridSearchCV without groups")
-            gs.fit(X, y)
-
-        # Step 5: Save results
-        self.final_model_ = gs.best_estimator_
-        self.best_params_ = gs.best_params_
-        self.best_cv_score_ = gs.best_score_
-
-        logger.info(f"GridSearchCV finished. Best CV score: {self.best_cv_score_}")
-        logger.info(f"Best parameters: {self.best_params_}")
-
-        # Train score for refitted best model
-        proba = self.final_model_.predict_proba(X)[:, 1]
-        self.train_score_ = roc_auc_score(y, proba)
-        logger.info(f"Train ROC AUC (refit on full training set): {self.train_score_}")
-
-        if save_path:
-            try:
-                joblib.dump(self, save_path)
-                logger.info(f"Saved ChallengerModel to {save_path}")
-            except Exception as e:
-                logger.info(f"Failed to save model to {save_path}: {e}")
-
-        return self
-
-    # ------------------------------------------------------------------
-    # Prediction APIs
-    # ------------------------------------------------------------------
-    def predict(self, X: pd.DataFrame):
-        logger.info("predict called")
-        X = X[self.selected_features_]
-        preds = self.final_model_.predict(X)
-        logger.info(f"predict produced {len(preds)} predictions")
-        return preds
-
-    def predict_proba(self, X: pd.DataFrame):
-        logger.info("predict_proba called")
-        X = X[self.selected_features_]
-        proba = self.final_model_.predict_proba(X)
-        logger.info(f"predict_proba produced probabilities with shape {proba.shape}")
-        return proba
+    "n_jobs": 1,                       # Single-threaded deterministic execution (recommended for reproducibility).
+    "verbose": False                   # Set True to inspect binning decisions and merging behavior.
+}
