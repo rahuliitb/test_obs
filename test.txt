@@ -1,99 +1,141 @@
-strict_binning_params = {
-    "variable_names": None,            # List of features to bin. MUST be set before initializing BinningProcess.
+def challenger_model_randomsearch_or_cv(
+    df: pd.DataFrame,
+    numeric_cols: List[str],
+    target_col: str,
+    cv,
+    groups: Optional[np.ndarray] = None,
+    binning_fit_params: Optional[Dict[str, Any]] = None,
+    iv_threshold: float = 0.02,
+    min_features: int = 1,
+    regularization: str = "l2",
+    scoring: str = "roc_auc",
+    tune_hyperparameters: bool = True,
+    param_distributions: Optional[Dict[str, Any]] = None,
+    n_iter: int = 20,
+    n_jobs: int = -1,
+    verbose: int = 0,
+):
+    """
+    Returns:
+        - iv_report
+        - selected_features
+        - final_model  (ALWAYS fitted)
+        - If tuning:
+            best_params, best_cv_score
+        - If no tuning:
+            cv_scores, mean_cv_score
+    """
 
-    "max_n_prebins": 10,               # Max pre-bins before optimization. Lower = smoother, less overfitting.
-    "min_prebin_size": 0.08,           # Each pre-bin must contain ≥ 8% of samples → stable grouping.
+    # ----------------------------
+    # 1) Expand binning params
+    # ----------------------------
+    bfp_raw = binning_fit_params or {}
+    if isinstance(bfp_raw, dict) and "global" in bfp_raw:
+        g = bfp_raw["global"] or {}
+        per_var_map = {c: {**g, **(bfp_raw.get(c, {}) or {})} for c in numeric_cols}
+    else:
+        per_var_map = {c: (bfp_raw.get(c, {}) if isinstance(bfp_raw, dict) else {})
+                       for c in numeric_cols}
 
-    "min_n_bins": 2,                   # Final bins must be at least 2 (prevents trivial single-bin cases).
-    "max_n_bins": 5,                   # Caps total bins → prevents overly granular splits that overfit.
+    # ----------------------------
+    # 2) IV computation
+    # ----------------------------
+    X_all = df[numeric_cols]
+    y_all = df[target_col].values
 
-    "min_bin_size": 0.05,              # Each final bin must contain ≥ 5% samples → avoids tiny, unstable bins.
-    "max_bin_size": 0.5,               # Upper bound on bin size → prevents overly dominant bins.
+    bp_iv = BinningProcess(variable_names=numeric_cols, binning_fit_params=per_var_map)
+    bp_iv.fit(X_all, y_all)
 
-    "max_pvalue": 0.05,                # Adjacent bins must differ statistically (p ≤ 0.05). Merges weak splits.
-    "max_pvalue_policy": "consecutive",# Only compare consecutive bins for p-value test; stable & efficient.
+    iv_df = (
+        bp_iv.summary()[["variable", "iv"]]
+        .sort_values("iv", ascending=False)
+        .reset_index(drop=True)
+    )
 
-    # Variable selection to avoid weak predictors.
-    "selection_criteria": {
-        "iv": {                        # Information Value (IV) filter:
-            "min": 0.02,               # Keep only variables with IV ≥ 0.02 (weak but meaningful).
-            "strategy": "highest",     # Rank variables by highest IV.
-            "top": 0.40                # Keep top 40% IV variables → strong dimensionality reduction.
-        },
-        "ks": {                        # Kolmogorov–Smirnov statistic filter:
-            "min": 0.05                # KS ≥ 0.05 ensures separation between good/bad distributions.
-        }
-    },
-
-    "fixed_variables": None,           # Variables that must be kept regardless of selection_criteria.
-
-    "categorical_variables": None,     # Variables treated as categorical (numeric but nominal). Used in binning.
-
-    "special_codes": None,             # Values treated separately (e.g., -999 for missing codes).
-
-    "split_digits": 3,                 # Round final split points to 3 significant digits → stable & interpretable.
-
-    # Per-variable overrides:
-    "binning_fit_params": None,        # Dict: {"var1": {"max_n_bins": 4, ...}} custom fit rules per variable.
-    "binning_transform_params": None,  # Dict: {"var1": {"metric": "event_rate"}} custom transform per variable.
-
-    "n_jobs": 1,                       # Single-threaded deterministic execution (recommended for reproducibility).
-    "verbose": False                   # Set True to inspect binning decisions and merging behavior.
-}
-
-
-
-
-# Build pipeline for selected features
-    # ------------------------
-    def _build_pipeline(self):
-        if self.selected_features_ is None:
-            raise RuntimeError("Call select_features() before building pipeline.")
-
-        binning = BinningProcess(
-            variable_names=self.selected_features_,
-            special_codes=self.special_codes,
-            binning_fit_params=self.binning_fit_params
-        )
-        scaler = StandardScaler()
-
-        # Choose solver based on regularization options
-        if self.regularization == "both":
-            # saga supports l1 and l2 (and is robust for large sparse data)
-            solver = "saga"
-        else:
-            # default solver for l2
-            solver = "lbfgs"
-
-        clf = LogisticRegression(
-            max_iter=2000,
-            random_state=self.random_state,
-            solver=solver
+    # ----------------------------
+    # 3) Strict IV selection
+    # ----------------------------
+    selected = iv_df[iv_df["iv"] >= iv_threshold]["variable"].tolist()
+    if len(selected) < min_features:
+        raise ValueError(
+            f"Only {len(selected)} features >= IV {iv_threshold}, need >= {min_features}."
         )
 
-        pipe = Pipeline([("binning", binning), ("scaler", scaler), ("clf", clf)])
-        return pipe
+    selected = [v for v in iv_df["variable"].tolist() if v in selected]
+    X_sel = df[selected]
 
-    # ------------------------
-    # Construct default param grid (adapts to regularization choice)
-    # ------------------------
-    def _build_param_grid(self) -> Dict[str, Any]:
-        if self._user_param_grid is not None:
-            return self._user_param_grid
+    # ----------------------------
+    # 4) Build pipeline
+    # ----------------------------
+    solver = "lbfgs" if regularization == "l2" else "saga"
 
-        # base grid: tune C (inverse regularization strength)
-        base_grid = {
-            "clf__C": [0.001, 0.01, 0.1, 1.0, 10.0]
+    selected_bfp = {v: per_var_map.get(v, {}) for v in selected}
+
+    pipe = Pipeline([
+        ("binning", BinningProcess(variable_names=selected, binning_fit_params=selected_bfp)),
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=2000, solver=solver)),
+    ])
+
+    # ================================================================
+    # MODE A — Hyperparameter tuning WITH refit=True
+    # ================================================================
+    if tune_hyperparameters:
+
+        if param_distributions is None:
+            param_distributions = {
+                "clf__C": loguniform(1e-4, 1e1),
+                "clf__class_weight": [None, "balanced"],
+            }
+            if regularization == "both":
+                param_distributions["clf__penalty"] = ["l1", "l2"]
+
+        rs = RandomizedSearchCV(
+            estimator=pipe,
+            param_distributions=param_distributions,
+            n_iter=n_iter,
+            scoring=scoring,
+            cv=cv,
+            refit=True,             # <<< IMPORTANT: refit ON full data
+            verbose=verbose,
+            n_jobs=n_jobs,
+            random_state=42
+        )
+
+        rs.fit(X_sel, y_all, groups=groups)
+
+        final_model = rs.best_estimator_     # fully fitted model
+
+        return {
+            "mode": "random_search",
+            "iv_report": iv_df,
+            "selected_features": selected,
+            "best_params": rs.best_params_,
+            "best_cv_score": rs.best_score_,
+            "cv_results": rs.cv_results_,
+            "final_model": final_model       # <<< fully fitted pipeline
         }
 
-        if self.regularization == "both":
-            # allow both penalties
-            base_grid["clf__penalty"] = ["l1", "l2"]
-            # saga supports penalty l1 and l2; if using saga, solver ok
-            # optionally keep class_weight tuning
-            base_grid["clf__class_weight"] = [None, "balanced"]
-        else:
-            # only l2: no penalty hyperparameter needed (solver default 'lbfgs' supports l2)
-            base_grid["clf__class_weight"] = [None, "balanced"]
+    # ================================================================
+    # MODE B — No hyperparameter tuning
+    # ================================================================
+    else:
+        cv_scores = cross_val_score(
+            pipe, X_sel, y_all,
+            cv=cv,
+            groups=groups,
+            scoring=scoring,
+            n_jobs=n_jobs
+        )
 
-        return base_grid
+        # Fit once on full data
+        final_model = pipe.fit(X_sel, y_all)
+
+        return {
+            "mode": "cv_only",
+            "iv_report": iv_df,
+            "selected_features": selected,
+            "cv_scores": cv_scores.tolist(),
+            "mean_cv_score": float(np.mean(cv_scores)),
+            "final_model": final_model     # <<< fully fitted model
+        }
