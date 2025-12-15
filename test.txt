@@ -1,141 +1,189 @@
-def challenger_model_randomsearch_or_cv(
-    df: pd.DataFrame,
-    numeric_cols: List[str],
-    target_col: str,
-    cv,
-    groups: Optional[np.ndarray] = None,
-    binning_fit_params: Optional[Dict[str, Any]] = None,
-    iv_threshold: float = 0.02,
-    min_features: int = 1,
-    regularization: str = "l2",
-    scoring: str = "roc_auc",
-    tune_hyperparameters: bool = True,
-    param_distributions: Optional[Dict[str, Any]] = None,
-    n_iter: int = 20,
-    n_jobs: int = -1,
-    verbose: int = 0,
-):
-    """
-    Returns:
-        - iv_report
-        - selected_features
-        - final_model  (ALWAYS fitted)
-        - If tuning:
-            best_params, best_cv_score
-        - If no tuning:
-            cv_scores, mean_cv_score
-    """
+from typing import List, Dict, Any, Optional
+import numpy as np
+import pandas as pd
+from optbinning import BinningProcess
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import RandomizedSearchCV, cross_val_score
+from scipy.stats import loguniform
 
-    # ----------------------------
-    # 1) Expand binning params
-    # ----------------------------
-    bfp_raw = binning_fit_params or {}
-    if isinstance(bfp_raw, dict) and "global" in bfp_raw:
-        g = bfp_raw["global"] or {}
-        per_var_map = {c: {**g, **(bfp_raw.get(c, {}) or {})} for c in numeric_cols}
-    else:
-        per_var_map = {c: (bfp_raw.get(c, {}) if isinstance(bfp_raw, dict) else {})
-                       for c in numeric_cols}
 
-    # ----------------------------
-    # 2) IV computation
-    # ----------------------------
-    X_all = df[numeric_cols]
-    y_all = df[target_col].values
+class ChallengerModel:
+    def __init__(
+        self,
+        numeric_cols: List[str],
+        target_col: str,
+        iv_threshold: float = 0.02,
+        min_features: int = 1,
+        regularization: str = "l2",       # "l2" or "both"
+        scoring: str = "roc_auc",
+        binning_fit_params: Optional[Dict[str, Any]] = None,
+        n_iter: int = 20,
+        n_jobs: int = -1,
+        verbose: int = 0,
+    ):
+        self.numeric_cols = numeric_cols
+        self.target_col = target_col
+        self.iv_threshold = iv_threshold
+        self.min_features = min_features
+        self.regularization = regularization
+        self.scoring = scoring
+        self.binning_fit_params_raw = binning_fit_params or {}
+        self.n_iter = n_iter
+        self.n_jobs = n_jobs
+        self.verbose = verbose
 
-    bp_iv = BinningProcess(variable_names=numeric_cols, binning_fit_params=per_var_map)
-    bp_iv.fit(X_all, y_all)
+        # Will be filled during fit()
+        self.selected_features_ = None
+        self.iv_report_ = None
+        self.final_model_ = None
+        self.best_params_ = None
+        self.best_cv_score_ = None
 
-    iv_df = (
-        bp_iv.summary()[["variable", "iv"]]
-        .sort_values("iv", ascending=False)
-        .reset_index(drop=True)
-    )
+    # ------------------------------------------------------------
+    # Expand global + per-variable binning parameters
+    # ------------------------------------------------------------
+    def _expand_binning_params(self):
+        raw = self.binning_fit_params_raw
 
-    # ----------------------------
-    # 3) Strict IV selection
-    # ----------------------------
-    selected = iv_df[iv_df["iv"] >= iv_threshold]["variable"].tolist()
-    if len(selected) < min_features:
-        raise ValueError(
-            f"Only {len(selected)} features >= IV {iv_threshold}, need >= {min_features}."
+        if "global" in raw:
+            g = raw["global"] or {}
+            return {col: {**g, **(raw.get(col, {}) or {})} for col in self.numeric_cols}
+        else:
+            return {col: (raw.get(col, {}) if isinstance(raw, dict) else {})
+                    for col in self.numeric_cols}
+
+    # ------------------------------------------------------------
+    # Compute IV and select features
+    # ------------------------------------------------------------
+    def _compute_iv_and_select(self, df):
+        per_var_bfp = self._expand_binning_params()
+
+        X = df[self.numeric_cols]
+        y = df[self.target_col].values
+
+        bp = BinningProcess(
+            variable_names=self.numeric_cols,
+            binning_fit_params=per_var_bfp
         )
+        bp.fit(X, y)
 
-    selected = [v for v in iv_df["variable"].tolist() if v in selected]
-    X_sel = df[selected]
-
-    # ----------------------------
-    # 4) Build pipeline
-    # ----------------------------
-    solver = "lbfgs" if regularization == "l2" else "saga"
-
-    selected_bfp = {v: per_var_map.get(v, {}) for v in selected}
-
-    pipe = Pipeline([
-        ("binning", BinningProcess(variable_names=selected, binning_fit_params=selected_bfp)),
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=2000, solver=solver)),
-    ])
-
-    # ================================================================
-    # MODE A — Hyperparameter tuning WITH refit=True
-    # ================================================================
-    if tune_hyperparameters:
-
-        if param_distributions is None:
-            param_distributions = {
-                "clf__C": loguniform(1e-4, 1e1),
-                "clf__class_weight": [None, "balanced"],
-            }
-            if regularization == "both":
-                param_distributions["clf__penalty"] = ["l1", "l2"]
-
-        rs = RandomizedSearchCV(
-            estimator=pipe,
-            param_distributions=param_distributions,
-            n_iter=n_iter,
-            scoring=scoring,
-            cv=cv,
-            refit=True,             # <<< IMPORTANT: refit ON full data
-            verbose=verbose,
-            n_jobs=n_jobs,
-            random_state=42
+        iv_df = (
+            bp.summary()[["variable", "iv"]]
+            .sort_values("iv", ascending=False)
+            .reset_index(drop=True)
         )
+        self.iv_report_ = iv_df
 
-        rs.fit(X_sel, y_all, groups=groups)
+        selected = iv_df[iv_df["iv"] >= self.iv_threshold]["variable"].tolist()
+        if len(selected) < self.min_features:
+            raise ValueError(
+                f"Only {len(selected)} features >= IV threshold {self.iv_threshold}; "
+                f"minimum required = {self.min_features}."
+            )
 
-        final_model = rs.best_estimator_     # fully fitted model
+        # preserve ranking
+        selected = [v for v in iv_df["variable"].tolist() if v in selected]
+        self.selected_features_ = selected
 
-        return {
-            "mode": "random_search",
-            "iv_report": iv_df,
-            "selected_features": selected,
-            "best_params": rs.best_params_,
-            "best_cv_score": rs.best_score_,
-            "cv_results": rs.cv_results_,
-            "final_model": final_model       # <<< fully fitted pipeline
-        }
+    # ------------------------------------------------------------
+    # Build pipeline with selected features
+    # ------------------------------------------------------------
+    def _build_pipeline(self):
+        per_var = self._expand_binning_params()
+        bfp = {v: per_var.get(v, {}) for v in self.selected_features_}
+        solver = "lbfgs" if self.regularization == "l2" else "saga"
 
-    # ================================================================
-    # MODE B — No hyperparameter tuning
-    # ================================================================
-    else:
-        cv_scores = cross_val_score(
-            pipe, X_sel, y_all,
-            cv=cv,
-            groups=groups,
-            scoring=scoring,
-            n_jobs=n_jobs
-        )
+        pipe = Pipeline([
+            ("binning", BinningProcess(
+                variable_names=self.selected_features_,
+                binning_fit_params=bfp
+            )),
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=2000, solver=solver))
+        ])
+        return pipe
 
-        # Fit once on full data
-        final_model = pipe.fit(X_sel, y_all)
+    # ------------------------------------------------------------
+    # Fit: tuning or CV-only
+    # ------------------------------------------------------------
+    def fit(
+        self,
+        df: pd.DataFrame,
+        cv,
+        groups: np.ndarray,
+        tune_hyperparameters: bool = True,
+        param_distributions: Optional[Dict[str, Any]] = None,
+    ):
+        # 1) Feature selection using IV
+        self._compute_iv_and_select(df)
 
-        return {
-            "mode": "cv_only",
-            "iv_report": iv_df,
-            "selected_features": selected,
-            "cv_scores": cv_scores.tolist(),
-            "mean_cv_score": float(np.mean(cv_scores)),
-            "final_model": final_model     # <<< fully fitted model
-        }
+        X = df[self.selected_features_]
+        y = df[self.target_col].values
+
+        # 2) Build base pipeline
+        pipe = self._build_pipeline()
+
+        # =========================================================
+        # MODE A — Hyperparameter Tuning (RandomizedSearchCV)
+        # =========================================================
+        if tune_hyperparameters:
+
+            # Default search space
+            if param_distributions is None:
+                param_distributions = {
+                    "clf__C": loguniform(1e-4, 1e1),
+                    "clf__class_weight": [None, "balanced"]
+                }
+                if self.regularization == "both":
+                    param_distributions["clf__penalty"] = ["l1", "l2"]
+
+            rs = RandomizedSearchCV(
+                estimator=pipe,
+                param_distributions=param_distributions,
+                n_iter=self.n_iter,
+                scoring=self.scoring,
+                cv=cv,
+                groups=groups,
+                refit=True,                    # FINAL MODEL FITTED AUTOMATICALLY
+                n_jobs=self.n_jobs,
+                verbose=self.verbose,
+                random_state=42,
+            )
+
+            rs.fit(X, y)
+            self.best_params_ = rs.best_params_
+            self.best_cv_score_ = rs.best_score_
+            self.final_model_ = rs.best_estimator_
+
+            return self
+
+        # =========================================================
+        # MODE B — CV ONLY (NO TUNING)
+        # =========================================================
+        else:
+            cv_scores = cross_val_score(
+                pipe, X, y,
+                cv=cv,
+                groups=groups,
+                scoring=self.scoring,
+                n_jobs=self.n_jobs
+            )
+
+            self.best_cv_score_ = float(np.mean(cv_scores))
+
+            # Fit final model with default params
+            pipe.fit(X, y)
+            self.final_model_ = pipe
+
+            return self
+
+    # ------------------------------------------------------------
+    # Predict / Predict Proba
+    # ------------------------------------------------------------
+    def predict(self, df):
+        return self.final_model_.predict(df[self.selected_features_])
+
+    def predict_proba(self, df):
+        return self.final_model_.predict_proba(df[self.selected_features_])[:, 1]
