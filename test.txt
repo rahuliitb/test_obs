@@ -6,138 +6,186 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import RandomizedSearchCV, cross_val_score
+from sklearn.metrics import roc_auc_score
 from scipy.stats import loguniform
 
 
 class ChallengerModel:
+    """
+    Credit-risk challenger model using OptBinning, IV-based feature selection,
+    logistic regression, randomized hyperparameter tuning, grouped CV, and
+    out-of-time (OOT) evaluation.
+    """
+
     def __init__(
         self,
         numeric_cols: List[str],
-        target_col: str,
         iv_threshold: float = 0.02,
         min_features: int = 1,
-        regularization: str = "l2",       # "l2" or "both"
+        max_features: int = 15,
         scoring: str = "roc_auc",
-        binning_fit_params: Optional[Dict[str, Any]] = None,
+        binning_params: Optional[Dict[str, Any]] = None,
+        default_clf_params: Optional[Dict[str, Any]] = None,
         n_iter: int = 20,
         n_jobs: int = -1,
         verbose: int = 0,
-    ):
+    ) -> None:
+        """
+        Initialize the ChallengerModel.
+
+        Args:
+            numeric_cols: Input numerical feature names.
+            iv_threshold: Minimum Information Value threshold.
+            min_features: Minimum number of features required.
+            max_features: Maximum number of features allowed.
+            scoring: Metric used during model evaluation.
+            binning_params: Parameters forwarded to OptBinning.
+            default_clf_params: Default LogisticRegression parameters.
+            n_iter: Number of hyperparameter search iterations.
+            n_jobs: Number of parallel jobs.
+            verbose: Verbosity level.
+        """
         self.numeric_cols = numeric_cols
-        self.target_col = target_col
         self.iv_threshold = iv_threshold
         self.min_features = min_features
-        self.regularization = regularization
+        self.max_features = max_features
         self.scoring = scoring
-        self.binning_fit_params_raw = binning_fit_params or {}
+
+        self.binning_params = binning_params or {}
+        self.default_clf_params = default_clf_params or {
+            "penalty": "l2",
+            "solver": "lbfgs",
+            "C": 1.0,
+            "max_iter": 2000,
+            "class_weight": None,
+        }
+
         self.n_iter = n_iter
         self.n_jobs = n_jobs
         self.verbose = verbose
 
-        # Will be filled during fit()
-        self.selected_features_ = None
-        self.iv_report_ = None
-        self.final_model_ = None
-        self.best_params_ = None
-        self.best_cv_score_ = None
+        self.selected_features_: Optional[List[str]] = None
+        self.iv_report_: Optional[pd.DataFrame] = None
+        self.final_model_: Optional[Pipeline] = None
+        self.best_params_: Optional[Dict[str, Any]] = None
+        self.best_cv_score_: Optional[float] = None
+        self.it_auc: Optional[float] = None
+        self.oot_auc: Optional[float] = None
 
-    # ------------------------------------------------------------
-    # Expand global + per-variable binning parameters
-    # ------------------------------------------------------------
-    def _expand_binning_params(self):
-        raw = self.binning_fit_params_raw
+    def _compute_feature_report(
+        self,
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+    ) -> None:
+        """
+        Fit BinningProcess, obtain full summary, and select optimal features.
 
-        if "global" in raw:
-            g = raw["global"] or {}
-            return {col: {**g, **(raw.get(col, {}) or {})} for col in self.numeric_cols}
-        else:
-            return {col: (raw.get(col, {}) if isinstance(raw, dict) else {})
-                    for col in self.numeric_cols}
+        Args:
+            X_train: Training input features.
+            y_train: Training target labels.
 
-    # ------------------------------------------------------------
-    # Compute IV and select features
-    # ------------------------------------------------------------
-    def _compute_iv_and_select(self, df):
-        per_var_bfp = self._expand_binning_params()
-
-        X = df[self.numeric_cols]
-        y = df[self.target_col].values
-
+        Raises:
+            ValueError: If fewer than `min_features` are selected.
+        """
         bp = BinningProcess(
             variable_names=self.numeric_cols,
-            binning_fit_params=per_var_bfp
+            **self.binning_params,
         )
-        bp.fit(X, y)
+        bp.fit(X_train, y_train)
 
-        iv_df = (
-            bp.summary()[["variable", "iv"]]
-            .sort_values("iv", ascending=False)
-            .reset_index(drop=True)
-        )
-        self.iv_report_ = iv_df
+        summary = bp.summary()
 
-        selected = iv_df[iv_df["iv"] >= self.iv_threshold]["variable"].tolist()
+        # Keep only selected (optimal) variables
+        summary_opt = summary[summary["selected"]]
+
+        selected = summary_opt["variable"].tolist()
+
         if len(selected) < self.min_features:
             raise ValueError(
-                f"Only {len(selected)} features >= IV threshold {self.iv_threshold}; "
-                f"minimum required = {self.min_features}."
+                f"Only {len(selected)} features selected, "
+                f"minimum required is {self.min_features}."
             )
 
-        # preserve ranking
-        selected = [v for v in iv_df["variable"].tolist() if v in selected]
+        # Apply max-features constraint
+        if len(selected) > self.max_features:
+            sorted_iv = (
+                summary_opt.sort_values("iv", ascending=False)["variable"].tolist()
+            )
+            selected = sorted_iv[: self.max_features]
+
+        self.iv_report_ = summary_opt
         self.selected_features_ = selected
 
-    # ------------------------------------------------------------
-    # Build pipeline with selected features
-    # ------------------------------------------------------------
-    def _build_pipeline(self):
-        per_var = self._expand_binning_params()
-        bfp = {v: per_var.get(v, {}) for v in self.selected_features_}
-        solver = "lbfgs" if self.regularization == "l2" else "saga"
+    def _build_pipeline(self, tuning: bool) -> Pipeline:
+        """
+        Build the modeling pipeline: OptBinning → StandardScaler → LogisticRegression.
 
-        pipe = Pipeline([
-            ("binning", BinningProcess(
-                variable_names=self.selected_features_,
-                binning_fit_params=bfp
-            )),
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=2000, solver=solver))
-        ])
-        return pipe
+        Args:
+            tuning: Whether pipeline is used for hyperparameter tuning.
 
-    # ------------------------------------------------------------
-    # Fit: tuning or CV-only
-    # ------------------------------------------------------------
+        Returns:
+            Pipeline: sklearn modeling pipeline.
+        """
+        if tuning:
+            clf = LogisticRegression(solver="saga", max_iter=5000)
+        else:
+            clf = LogisticRegression(**self.default_clf_params)
+
+        return Pipeline(
+            [
+                (
+                    "binning",
+                    BinningProcess(
+                        variable_names=self.selected_features_,
+                        **self.binning_params,
+                    ),
+                ),
+                ("scaler", StandardScaler()),
+                ("clf", clf),
+            ]
+        )
+
     def fit(
         self,
-        df: pd.DataFrame,
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+        X_oot: pd.DataFrame,
+        y_oot: np.ndarray,
         cv,
-        groups: np.ndarray,
+        groups_train: np.ndarray,
         tune_hyperparameters: bool = True,
         param_distributions: Optional[Dict[str, Any]] = None,
-    ):
-        # 1) Feature selection using IV
-        self._compute_iv_and_select(df)
+    ) -> "ChallengerModel":
+        """
+        Fit model using training data, with optional hyperparameter tuning.
 
-        X = df[self.selected_features_]
-        y = df[self.target_col].values
+        Args:
+            X_train: Training feature matrix.
+            y_train: Training target labels.
+            X_oot: Out-of-time feature matrix.
+            y_oot: Out-of-time target labels.
+            cv: Group-aware cross-validation splitter.
+            groups_train: Group labels for each training row.
+            tune_hyperparameters: Whether to run RandomizedSearchCV.
+            param_distributions: Search space for hyperparameter tuning.
 
-        # 2) Build base pipeline
-        pipe = self._build_pipeline()
+        Returns:
+            ChallengerModel: The fitted model instance.
+        """
+        self._compute_feature_report(X_train, y_train)
 
-        # =========================================================
-        # MODE A — Hyperparameter Tuning (RandomizedSearchCV)
-        # =========================================================
+        X = X_train[self.selected_features_]
+        Xo = X_oot[self.selected_features_]
+
+        pipe = self._build_pipeline(tune_hyperparameters)
+
         if tune_hyperparameters:
-
-            # Default search space
             if param_distributions is None:
                 param_distributions = {
                     "clf__C": loguniform(1e-4, 1e1),
-                    "clf__class_weight": [None, "balanced"]
+                    "clf__class_weight": [None, "balanced"],
+                    "clf__penalty": ["l1", "l2"],
                 }
-                if self.regularization == "both":
-                    param_distributions["clf__penalty"] = ["l1", "l2"]
 
             rs = RandomizedSearchCV(
                 estimator=pipe,
@@ -145,45 +193,60 @@ class ChallengerModel:
                 n_iter=self.n_iter,
                 scoring=self.scoring,
                 cv=cv,
-                groups=groups,
-                refit=True,                    # FINAL MODEL FITTED AUTOMATICALLY
+                groups=groups_train,
+                refit=True,
                 n_jobs=self.n_jobs,
                 verbose=self.verbose,
                 random_state=42,
             )
-
-            rs.fit(X, y)
+            rs.fit(X, y_train)
+            self.final_model_ = rs.best_estimator_
             self.best_params_ = rs.best_params_
             self.best_cv_score_ = rs.best_score_
-            self.final_model_ = rs.best_estimator_
-
-            return self
-
-        # =========================================================
-        # MODE B — CV ONLY (NO TUNING)
-        # =========================================================
         else:
             cv_scores = cross_val_score(
-                pipe, X, y,
+                pipe,
+                X,
+                y_train,
                 cv=cv,
-                groups=groups,
+                groups=groups_train,
                 scoring=self.scoring,
-                n_jobs=self.n_jobs
+                n_jobs=self.n_jobs,
             )
-
             self.best_cv_score_ = float(np.mean(cv_scores))
 
-            # Fit final model with default params
-            pipe.fit(X, y)
+            pipe.fit(X, y_train)
             self.final_model_ = pipe
+            self.best_params_ = pipe.named_steps["clf"].get_params()
 
-            return self
+        # Compute AUCs
+        self.it_auc = roc_auc_score(y_train, self.final_model_.predict_proba(X)[:, 1])
+        self.oot_auc = roc_auc_score(y_oot, self.final_model_.predict_proba(Xo)[:, 1])
 
-    # ------------------------------------------------------------
-    # Predict / Predict Proba
-    # ------------------------------------------------------------
-    def predict(self, df):
-        return self.final_model_.predict(df[self.selected_features_])
+        return self
 
-    def predict_proba(self, df):
-        return self.final_model_.predict_proba(df[self.selected_features_])[:, 1]
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Predict positive-class probabilities.
+
+        Args:
+            X: Input dataframe.
+
+        Returns:
+            np.ndarray: Probability scores.
+        """
+        return self.final_model_.predict_proba(
+            X[self.selected_features_]
+        )[:, 1]
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Predict binary class labels.
+
+        Args:
+            X: Input dataframe.
+
+        Returns:
+            np.ndarray: Predicted class labels.
+        """
+        return self.final_model_.predict(X[self.selected_features_])
