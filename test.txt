@@ -1,252 +1,147 @@
-from typing import List, Dict, Any, Optional
 import numpy as np
-import pandas as pd
-from optbinning import BinningProcess
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import RandomizedSearchCV, cross_val_score
+import lightgbm as lgb
+import optuna
+
+from sklearn.datasets import make_classification
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
-from scipy.stats import loguniform
+
+X, y = make_classification(
+    n_samples=15000,
+    n_features=20,
+    n_informative=8,
+    n_redundant=5,
+    weights=[0.9, 0.1],   # 10% positives
+    flip_y=0.01,
+    random_state=42
+)
+
+dtrain = lgb.Dataset(X, label=y)
+
+def stable_sigmoid(x):
+    x = np.asarray(x)
+    out = np.empty_like(x, dtype=np.float64)
+
+    pos = x >= 0
+    neg = ~pos
+
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    exp_x = np.exp(x[neg])
+    out[neg] = exp_x / (1.0 + exp_x)
+
+    return out
 
 
-class ChallengerModel:
-    """
-    Credit-risk challenger model using OptBinning, IV-based feature selection,
-    logistic regression, randomized hyperparameter tuning, grouped CV, and
-    out-of-time (OOT) evaluation.
-    """
+class FocalLossObjective:
+    def __init__(self, alpha, gamma):
+        self.alpha = alpha
+        self.gamma = gamma
 
-    def __init__(
-        self,
-        numeric_cols: List[str],
-        iv_threshold: float = 0.02,
-        min_features: int = 1,
-        max_features: int = 15,
-        scoring: str = "roc_auc",
-        binning_params: Optional[Dict[str, Any]] = None,
-        default_clf_params: Optional[Dict[str, Any]] = None,
-        n_iter: int = 20,
-        n_jobs: int = -1,
-        verbose: int = 0,
-    ) -> None:
-        """
-        Initialize the ChallengerModel.
+    def __call__(self, preds, train_data):
+        y = train_data.get_label()
 
-        Args:
-            numeric_cols: Input numerical feature names.
-            iv_threshold: Minimum Information Value threshold.
-            min_features: Minimum number of features required.
-            max_features: Maximum number of features allowed.
-            scoring: Metric used during model evaluation.
-            binning_params: Parameters forwarded to OptBinning.
-            default_clf_params: Default LogisticRegression parameters.
-            n_iter: Number of hyperparameter search iterations.
-            n_jobs: Number of parallel jobs.
-            verbose: Verbosity level.
-        """
-        self.numeric_cols = numeric_cols
-        self.iv_threshold = iv_threshold
-        self.min_features = min_features
-        self.max_features = max_features
-        self.scoring = scoring
+        p = stable_sigmoid(preds)
+        p = np.clip(p, 1e-7, 1 - 1e-7)
 
-        self.binning_params = binning_params or {}
-        self.default_clf_params = default_clf_params or {
-            "penalty": "l2",
-            "solver": "lbfgs",
-            "C": 1.0,
-            "max_iter": 2000,
-            "class_weight": None,
-        }
-
-        self.n_iter = n_iter
-        self.n_jobs = n_jobs
-        self.verbose = verbose
-
-        self.selected_features_: Optional[List[str]] = None
-        self.iv_report_: Optional[pd.DataFrame] = None
-        self.final_model_: Optional[Pipeline] = None
-        self.best_params_: Optional[Dict[str, Any]] = None
-        self.best_cv_score_: Optional[float] = None
-        self.it_auc: Optional[float] = None
-        self.oot_auc: Optional[float] = None
-
-    def _compute_feature_report(
-        self,
-        X_train: pd.DataFrame,
-        y_train: np.ndarray,
-    ) -> None:
-        """
-        Fit BinningProcess, obtain full summary, and select optimal features.
-
-        Args:
-            X_train: Training input features.
-            y_train: Training target labels.
-
-        Raises:
-            ValueError: If fewer than `min_features` are selected.
-        """
-        bp = BinningProcess(
-            variable_names=self.numeric_cols,
-            **self.binning_params,
-        )
-        bp.fit(X_train, y_train)
-
-        summary = bp.summary()
-
-        # Keep only selected (optimal) variables
-        summary_opt = summary[summary["selected"]]
-
-        selected = summary_opt["variable"].tolist()
-
-        if len(selected) < self.min_features:
-            raise ValueError(
-                f"Only {len(selected)} features selected, "
-                f"minimum required is {self.min_features}."
-            )
-
-        # Apply max-features constraint
-        if len(selected) > self.max_features:
-            sorted_iv = (
-                summary_opt.sort_values("iv", ascending=False)["variable"].tolist()
-            )
-            selected = sorted_iv[: self.max_features]
-
-        self.iv_report_ = summary_opt
-        self.selected_features_ = selected
-
-    def _build_pipeline(self, tuning: bool) -> Pipeline:
-        """
-        Build the modeling pipeline: OptBinning → StandardScaler → LogisticRegression.
-
-        Args:
-            tuning: Whether pipeline is used for hyperparameter tuning.
-
-        Returns:
-            Pipeline: sklearn modeling pipeline.
-        """
-        if tuning:
-            clf = LogisticRegression(solver="saga", max_iter=5000)
-        else:
-            clf = LogisticRegression(**self.default_clf_params)
-
-        return Pipeline(
-            [
-                (
-                    "binning",
-                    BinningProcess(
-                        variable_names=self.selected_features_,
-                        **self.binning_params,
-                    ),
-                ),
-                ("scaler", StandardScaler()),
-                ("clf", clf),
-            ]
+        grad = (
+            self.alpha * y * (1 - p) ** self.gamma *
+            (self.gamma * p * np.log(p) + p - 1)
+            +
+            (1 - self.alpha) * (1 - y) * p ** self.gamma *
+            (self.gamma * (1 - p) * np.log(1 - p) + p)
         )
 
-    def fit(
-        self,
-        X_train: pd.DataFrame,
-        y_train: np.ndarray,
-        X_oot: pd.DataFrame,
-        y_oot: np.ndarray,
-        cv,
-        groups_train: np.ndarray,
-        tune_hyperparameters: bool = True,
-        param_distributions: Optional[Dict[str, Any]] = None,
-    ) -> "ChallengerModel":
-        """
-        Fit model using training data, with optional hyperparameter tuning.
+        hess = (
+            self.alpha * y * (1 - p) ** self.gamma *
+            ((self.gamma * (1 - p) - 1) * p +
+             self.gamma * p * (1 - p) * np.log(p))
+            +
+            (1 - self.alpha) * (1 - y) * p ** self.gamma *
+            ((self.gamma * p - 1) * (1 - p) +
+             self.gamma * p * (1 - p) * np.log(1 - p))
+        )
 
-        Args:
-            X_train: Training feature matrix.
-            y_train: Training target labels.
-            X_oot: Out-of-time feature matrix.
-            y_oot: Out-of-time target labels.
-            cv: Group-aware cross-validation splitter.
-            groups_train: Group labels for each training row.
-            tune_hyperparameters: Whether to run RandomizedSearchCV.
-            param_distributions: Search space for hyperparameter tuning.
+        return grad, np.maximum(hess, 1e-6)
 
-        Returns:
-            ChallengerModel: The fitted model instance.
-        """
-        self._compute_feature_report(X_train, y_train)
+    
+from sklearn.metrics import roc_auc_score
 
-        X = X_train[self.selected_features_]
-        Xo = X_oot[self.selected_features_]
+def lgb_auc_eval(preds, train_data):
+    y_true = train_data.get_label()
+    preds_prob = stable_sigmoid(preds)
+    auc = roc_auc_score(y_true, preds_prob)
+    return "auc", auc, True
 
-        pipe = self._build_pipeline(tune_hyperparameters)
 
-        if tune_hyperparameters:
-            if param_distributions is None:
-                param_distributions = {
-                    "clf__C": loguniform(1e-4, 1e1),
-                    "clf__class_weight": [None, "balanced"],
-                    "clf__penalty": ["l1", "l2"],
-                }
+    
+def run_lgb_cv(params, dtrain, X, y):
 
-            rs = RandomizedSearchCV(
-                estimator=pipe,
-                param_distributions=param_distributions,
-                n_iter=self.n_iter,
-                scoring=self.scoring,
-                cv=cv,
-                groups=groups_train,
-                refit=True,
-                n_jobs=self.n_jobs,
-                verbose=self.verbose,
-                random_state=42,
-            )
-            rs.fit(X, y_train)
-            self.final_model_ = rs.best_estimator_
-            self.best_params_ = rs.best_params_
-            self.best_cv_score_ = rs.best_score_
-        else:
-            cv_scores = cross_val_score(
-                pipe,
-                X,
-                y_train,
-                cv=cv,
-                groups=groups_train,
-                scoring=self.scoring,
-                n_jobs=self.n_jobs,
-            )
-            self.best_cv_score_ = float(np.mean(cv_scores))
+    cv_results = lgb.cv(
+        params=params,
+        train_set=dtrain,
+        num_boost_round=2000,
+        folds=StratifiedKFold(
+            n_splits=5, shuffle=True, random_state=42
+        ),
+        feval=lgb_auc_eval,                    # ✅ REQUIRED
+        callbacks=[lgb.early_stopping(100)],  # ✅ NOW VALID
+        return_cvbooster=True,
+        seed=42
+    )
 
-            pipe.fit(X, y_train)
-            self.final_model_ = pipe
-            self.best_params_ = pipe.named_steps["clf"].get_params()
+    # ---- Out-of-fold raw predictions ----
+    cv_booster = cv_results["cvbooster"]
 
-        # Compute AUCs
-        self.it_auc = roc_auc_score(y_train, self.final_model_.predict_proba(X)[:, 1])
-        self.oot_auc = roc_auc_score(y_oot, self.final_model_.predict_proba(Xo)[:, 1])
+    raw_oof_preds = np.mean(
+        [booster.predict(X) for booster in cv_booster.boosters],
+        axis=0
+    )
 
-        return self
+    oof_preds = stable_sigmoid(raw_oof_preds)
+    auc = roc_auc_score(y, oof_preds)
 
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Predict positive-class probabilities.
+    return auc
 
-        Args:
-            X: Input dataframe.
+def objective(trial):
 
-        Returns:
-            np.ndarray: Probability scores.
-        """
-        return self.final_model_.predict_proba(
-            X[self.selected_features_]
-        )[:, 1]
+    alpha = trial.suggest_float("alpha", 0.1, 0.5)
+    gamma = trial.suggest_float("gamma", 1.0, 3.0)
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Predict binary class labels.
+    params = {
+    "objective": FocalLossObjective(alpha, gamma),
+    "boosting_type": "gbdt",
+    "feature_pre_filter": False,  # 🔥 REQUIRED
+    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+    "num_leaves": trial.suggest_int("num_leaves", 16, 128),
+    "max_depth": trial.suggest_int("max_depth", 3, 10),
+    "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
+    "subsample": trial.suggest_float("subsample", 0.7, 1.0),
+    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
+    "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+    "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+    "verbose": -1,
+    }
 
-        Args:
-            X: Input dataframe.
 
-        Returns:
-            np.ndarray: Predicted class labels.
-        """
-        return self.final_model_.predict(X[self.selected_features_])
+    return run_lgb_cv(params, dtrain, X, y)
+
+sampler = optuna.samplers.TPESampler(
+    seed=42,
+    n_startup_trials=10,      # random exploration first
+    n_ei_candidates=24,       # better candidate selection
+    multivariate=True,        # models param interactions
+    group=True                # good for correlated params
+)
+
+study = optuna.create_study(
+    direction="maximize",
+    sampler=sampler
+)
+
+study.optimize(objective, n_trials=20)
+
+print("Best AUC:", study.best_value)
+print("Best parameters:")
+for k, v in study.best_params.items():
+    print(f"  {k}: {v}")
+
