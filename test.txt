@@ -1,147 +1,266 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal
+
+import matplotlib.pyplot as plt
 import numpy as np
-import lightgbm as lgb
-import optuna
-
-from sklearn.datasets import make_classification
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-
-X, y = make_classification(
-    n_samples=15000,
-    n_features=20,
-    n_informative=8,
-    n_redundant=5,
-    weights=[0.9, 0.1],   # 10% positives
-    flip_y=0.01,
-    random_state=42
-)
-
-dtrain = lgb.Dataset(X, label=y)
-
-def stable_sigmoid(x):
-    x = np.asarray(x)
-    out = np.empty_like(x, dtype=np.float64)
-
-    pos = x >= 0
-    neg = ~pos
-
-    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
-    exp_x = np.exp(x[neg])
-    out[neg] = exp_x / (1.0 + exp_x)
-
-    return out
+import pandas as pd
+import shap
+from loguru import logger
+from sklearn.base import clone
+from sklearn.model_selection import GroupKFold
 
 
-class FocalLossObjective:
-    def __init__(self, alpha, gamma):
-        self.alpha = alpha
-        self.gamma = gamma
+DatasetType = Literal["it", "oos", "oot"]
 
-    def __call__(self, preds, train_data):
-        y = train_data.get_label()
 
-        p = stable_sigmoid(preds)
-        p = np.clip(p, 1e-7, 1 - 1e-7)
+# ------------------------------------------------------------------
+# LightGBM native importance helper
+# ------------------------------------------------------------------
+def compute_lgbm_importance(model) -> pd.DataFrame:
+    if hasattr(model, "booster_"):
+        booster = model.booster_
+    elif hasattr(model, "_Booster"):
+        booster = model._Booster
+    else:
+        raise TypeError("Model does not appear to be a LightGBM model")
 
-        grad = (
-            self.alpha * y * (1 - p) ** self.gamma *
-            (self.gamma * p * np.log(p) + p - 1)
-            +
-            (1 - self.alpha) * (1 - y) * p ** self.gamma *
-            (self.gamma * (1 - p) * np.log(1 - p) + p)
+    return (
+        pd.DataFrame(
+            {
+                "feature": booster.feature_name(),
+                "gain": booster.feature_importance("gain"),
+                "split": booster.feature_importance("split"),
+            }
         )
-
-        hess = (
-            self.alpha * y * (1 - p) ** self.gamma *
-            ((self.gamma * (1 - p) - 1) * p +
-             self.gamma * p * (1 - p) * np.log(p))
-            +
-            (1 - self.alpha) * (1 - y) * p ** self.gamma *
-            ((self.gamma * p - 1) * (1 - p) +
-             self.gamma * p * (1 - p) * np.log(1 - p))
-        )
-
-        return grad, np.maximum(hess, 1e-6)
-
-    
-from sklearn.metrics import roc_auc_score
-
-def lgb_auc_eval(preds, train_data):
-    y_true = train_data.get_label()
-    preds_prob = stable_sigmoid(preds)
-    auc = roc_auc_score(y_true, preds_prob)
-    return "auc", auc, True
-
-
-    
-def run_lgb_cv(params, dtrain, X, y):
-
-    cv_results = lgb.cv(
-        params=params,
-        train_set=dtrain,
-        num_boost_round=2000,
-        folds=StratifiedKFold(
-            n_splits=5, shuffle=True, random_state=42
-        ),
-        feval=lgb_auc_eval,                    # ✅ REQUIRED
-        callbacks=[lgb.early_stopping(100)],  # ✅ NOW VALID
-        return_cvbooster=True,
-        seed=42
+        .sort_values("gain", ascending=False)
+        .reset_index(drop=True)
     )
 
-    # ---- Out-of-fold raw predictions ----
-    cv_booster = cv_results["cvbooster"]
 
-    raw_oof_preds = np.mean(
-        [booster.predict(X) for booster in cv_booster.boosters],
-        axis=0
-    )
+# ------------------------------------------------------------------
+# CV SHAP Explainer
+# ------------------------------------------------------------------
+class CVShapExplainer:
+    """
+    Final, minimal, CV-safe explainability pipeline.
 
-    oof_preds = stable_sigmoid(raw_oof_preds)
-    auc = roc_auc_score(y, oof_preds)
+    Includes:
+    - SHAP: IT, OOS, OOT
+    - LightGBM native importance: IT, OOS (CV-mean), OOT
+    - Automatic plot + table export
+    """
 
-    return auc
+    def __init__(
+        self,
+        best_model,
+        n_splits: int = 5,
+        max_display: int = 35,
+    ) -> None:
+        self.best_model = best_model
+        self.base_estimator = clone(best_model)
+        self.n_splits = n_splits
+        self.max_display = max_display
 
-def objective(trial):
+        self.shap_it: np.ndarray | None = None
+        self.shap_oos: np.ndarray | None = None
+        self.shap_oot: np.ndarray | None = None
 
-    alpha = trial.suggest_float("alpha", 0.1, 0.5)
-    gamma = trial.suggest_float("gamma", 1.0, 3.0)
+        self.X_it: pd.DataFrame | None = None
+        self.X_oos: pd.DataFrame | None = None
+        self.X_oot: pd.DataFrame | None = None
 
-    params = {
-    "objective": FocalLossObjective(alpha, gamma),
-    "boosting_type": "gbdt",
-    "feature_pre_filter": False,  # 🔥 REQUIRED
-    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-    "num_leaves": trial.suggest_int("num_leaves", 16, 128),
-    "max_depth": trial.suggest_int("max_depth", 3, 10),
-    "min_child_samples": trial.suggest_int("min_child_samples", 50, 300),
-    "subsample": trial.suggest_float("subsample", 0.7, 1.0),
-    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),
-    "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-    "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-    "verbose": -1,
-    }
+        self._cv_importances: list[pd.DataFrame] = []
 
+        logger.info(
+            "CVShapExplainer initialized (cv_folds={}, max_display={})",
+            n_splits,
+            max_display,
+        )
 
-    return run_lgb_cv(params, dtrain, X, y)
+    # ------------------------------------------------------------------
+    # IT SHAP (diagnostic)
+    # ------------------------------------------------------------------
+    def fit_it(self, X_it: pd.DataFrame) -> "CVShapExplainer":
+        logger.info("Computing IT SHAP values (rows={})", len(X_it))
 
-sampler = optuna.samplers.TPESampler(
-    seed=42,
-    n_startup_trials=10,      # random exploration first
-    n_ei_candidates=24,       # better candidate selection
-    multivariate=True,        # models param interactions
-    group=True                # good for correlated params
-)
+        explainer = shap.TreeExplainer(self.best_model)
+        shap_vals = explainer.shap_values(X_it)
 
-study = optuna.create_study(
-    direction="maximize",
-    sampler=sampler
-)
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[1]  # positive class
 
-study.optimize(objective, n_trials=20)
+        self.shap_it = shap_vals
+        self.X_it = X_it
 
-print("Best AUC:", study.best_value)
-print("Best parameters:")
-for k, v in study.best_params.items():
-    print(f"  {k}: {v}")
+        return self
 
+    # ------------------------------------------------------------------
+    # CV-OOS SHAP
+    # ------------------------------------------------------------------
+    def fit_cv_oos(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        groups: pd.Series,
+    ) -> "CVShapExplainer":
+        logger.info(
+            "Computing CV-OOS SHAP (folds={}, rows={})",
+            self.n_splits,
+            len(X),
+        )
+
+        gkf = GroupKFold(n_splits=self.n_splits)
+
+        shap_values: list[np.ndarray] = []
+        X_values: list[pd.DataFrame] = []
+
+        for train_idx, val_idx in gkf.split(X, y, groups):
+            model = clone(self.base_estimator)
+            model.fit(X.iloc[train_idx], y.iloc[train_idx])
+
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(X.iloc[val_idx])
+
+            if isinstance(shap_vals, list):
+                shap_vals = shap_vals[1]
+
+            shap_values.append(shap_vals)
+            X_values.append(X.iloc[val_idx])
+
+            self._cv_importances.append(
+                compute_lgbm_importance(model)
+            )
+
+        self.shap_oos = np.vstack(shap_values)
+        self.X_oos = pd.concat(X_values, axis=0)
+
+        return self
+
+    # ------------------------------------------------------------------
+    # OOT SHAP
+    # ------------------------------------------------------------------
+    def fit_oot(self, X_oot: pd.DataFrame) -> "CVShapExplainer":
+        logger.info("Computing OOT SHAP values (rows={})", len(X_oot))
+
+        explainer = shap.TreeExplainer(self.best_model)
+        shap_vals = explainer.shap_values(X_oot)
+
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[1]
+
+        self.shap_oot = shap_vals
+        self.X_oot = X_oot
+
+        return self
+
+    # ------------------------------------------------------------------
+    # LightGBM native importance
+    # ------------------------------------------------------------------
+    def get_lgbm_importance(self, dataset: DatasetType) -> pd.DataFrame:
+        if dataset in {"it", "oot"}:
+            df = compute_lgbm_importance(self.best_model)
+
+        elif dataset == "oos":
+            df = (
+                pd.concat(self._cv_importances, axis=0)
+                .groupby("feature", as_index=False)
+                .mean()
+                .sort_values("gain", ascending=False)
+            )
+        else:
+            raise ValueError("dataset must be one of: 'it', 'oos', 'oot'")
+
+        df["dataset"] = dataset
+        return df.reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Explainability artifact export
+    # ------------------------------------------------------------------
+    def export_explainability_artifact(self, output_dir: str | Path) -> None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.shap_oos is None or self.X_oos is None:
+            raise RuntimeError("Run fit_cv_oos before exporting artifacts")
+
+        logger.info("Exporting explainability artifact to {}", output_dir)
+
+        # --------------------
+        # SHAP plots
+        # --------------------
+        for name, shap_vals, X in (
+            ("it", self.shap_it, self.X_it),
+            ("oos", self.shap_oos, self.X_oos),
+            ("oot", self.shap_oot, self.X_oot),
+        ):
+            if shap_vals is None or X is None:
+                continue
+
+            shap.summary_plot(
+                shap_vals,
+                X,
+                max_display=self.max_display,
+                show=False,
+            )
+            plt.savefig(
+                output_dir / f"shap_beeswarm_{name}.png",
+                bbox_inches="tight",
+            )
+            plt.close()
+
+        shap.summary_plot(
+            self.shap_oos,
+            self.X_oos,
+            plot_type="bar",
+            max_display=self.max_display,
+            show=False,
+        )
+        plt.savefig(
+            output_dir / "shap_bar_oos.png",
+            bbox_inches="tight",
+        )
+        plt.close()
+
+        # --------------------
+        # LightGBM importance plots
+        # --------------------
+        for dataset in ("it", "oos", "oot"):
+            df = self.get_lgbm_importance(dataset).head(self.max_display)
+
+            for col in ("gain", "split"):
+                (
+                    df.sort_values(col)
+                    .plot(
+                        kind="barh",
+                        x="feature",
+                        y=col,
+                        figsize=(8, max(4, len(df) * 0.3)),
+                        legend=False,
+                        title=f"LightGBM {col} importance ({dataset})",
+                    )
+                )
+                plt.savefig(
+                    output_dir / f"lgbm_{col}_{dataset}.png",
+                    bbox_inches="tight",
+                )
+                plt.close()
+
+        # --------------------
+        # Tables
+        # --------------------
+        self.get_lgbm_importance("it").to_csv(
+            output_dir / "lgbm_importance_it.csv",
+            index=False,
+        )
+        self.get_lgbm_importance("oos").to_csv(
+            output_dir / "lgbm_importance_oos.csv",
+            index=False,
+        )
+        self.get_lgbm_importance("oot").to_csv(
+            output_dir / "lgbm_importance_oot.csv",
+            index=False,
+        )
+
+        logger.info("Explainability artifact export completed")
