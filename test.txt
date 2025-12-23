@@ -386,3 +386,48 @@ def export_shap_dependence_plots(
 
     logger.info("SHAP dependence plot export completed")
 
+
+def _save_shap_summary_plot(
+    self,
+    shap_vals: np.ndarray,
+    X: pd.DataFrame,
+    path: Path,
+    *,
+    plot_type: str | None = None,
+) -> None:
+    """
+    Save a SHAP summary plot with layout fixes for long feature names.
+    """
+    plt.figure(figsize=(14, 0.35 * self.max_display))
+
+    shap.summary_plot(
+        shap_vals,
+        X,
+        plot_type=plot_type,
+        max_display=self.max_display,
+        show=False,
+    )
+
+    # Reduce font size of feature names
+    ax = plt.gca()
+    for label in ax.get_yticklabels():
+        label.set_fontsize(8)
+
+    # Add space for long feature names
+    plt.gcf().subplots_adjust(left=0.35)
+
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
+    self._save_shap_summary_plot(
+        shap_vals,
+        X,
+        output_dir / f"shap_beeswarm_{name}.png",
+    )
+self._save_shap_summary_plot(
+    self.shap_oos,
+    self.X_oos,
+    output_dir / "shap_bar_oos.png",
+    plot_type="bar",
+)
+
