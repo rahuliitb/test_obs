@@ -300,3 +300,89 @@ def run_explainability(
 
     return explainer
 
+import shutil
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+from loguru import logger
+
+
+def export_shap_dependence_plots(
+    explainer: CVShapExplainer,
+    output_dir: str | Path,
+    *,
+    datasets: tuple[str, ...] = ("it", "oos", "oot"),
+    max_features: int = 10,
+) -> None:
+    """
+    Export SHAP dependence plots with automatic interaction coloring.
+
+    If the output directory already exists, it is removed and recreated.
+    Uses existing SHAP values (no interaction values required).
+    """
+    output_dir = Path(output_dir)
+
+    # Clean existing directory (explicit and intentional)
+    if output_dir.exists():
+        logger.info(
+            "Output directory '{}' exists. Removing it.",
+            output_dir,
+        )
+        shutil.rmtree(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Exporting SHAP dependence plots (auto-interaction)")
+
+    data_map = {
+        "it": (explainer.shap_it, explainer.X_it),
+        "oos": (explainer.shap_oos, explainer.X_oos),
+        "oot": (explainer.shap_oot, explainer.X_oot),
+    }
+
+    for dataset in datasets:
+        shap_vals, X = data_map.get(dataset, (None, None))
+        if shap_vals is None or X is None:
+            logger.debug(
+                "Skipping dataset '{}' (SHAP values not available)",
+                dataset,
+            )
+            continue
+
+        dataset_dir = output_dir / dataset
+        dataset_dir.mkdir(exist_ok=True)
+
+        # Select top features by mean |SHAP|
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        top_features = (
+            pd.Series(mean_abs, index=X.columns)
+            .sort_values(ascending=False)
+            .head(max_features)
+            .index
+        )
+
+        logger.info(
+            "Dataset '{}' | exporting dependence plots for {} features",
+            dataset,
+            len(top_features),
+        )
+
+        for feature in top_features:
+            plt.figure()
+            shap.dependence_plot(
+                feature,
+                shap_vals,
+                X,
+                show=False,
+            )
+            plt.savefig(
+                dataset_dir / f"dependence_{feature}.png",
+                bbox_inches="tight",
+            )
+            plt.close()
+
+    logger.info("SHAP dependence plot export completed")
+
