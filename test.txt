@@ -264,3 +264,39 @@ class CVShapExplainer:
         )
 
         logger.info("Explainability artifact export completed")
+
+
+def run_explainability(
+    best_model,
+    X_it: pd.DataFrame,
+    y_it: pd.Series,
+    groups: pd.Series,
+    X_oot: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    n_splits: int = 5,
+    max_display: int = 35,
+) -> CVShapExplainer:
+    """
+    Run end-to-end explainability for IT, OOS, and OOT.
+
+    Returns the fitted CVShapExplainer for interactive use.
+    """
+    logger.info("Starting end-to-end explainability run")
+
+    explainer = CVShapExplainer(
+        best_model=best_model,
+        n_splits=n_splits,
+        max_display=max_display,
+    )
+
+    explainer.fit_it(X_it)
+    explainer.fit_cv_oos(X_it, y_it, groups)
+    explainer.fit_oot(X_oot)
+
+    explainer.export_explainability_artifact(output_dir)
+
+    logger.info("Explainability run completed")
+
+    return explainer
+
