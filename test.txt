@@ -431,3 +431,86 @@ self._save_shap_summary_plot(
     plot_type="bar",
 )
 
+def _save_shap_plot(
+    self,
+    *,
+    shap_vals: np.ndarray,
+    X: pd.DataFrame,
+    path: Path,
+    plot_kind: Literal["summary", "bar", "dependence"] = "summary",
+    feature: str | None = None,
+) -> None:
+    """
+    Save SHAP plots with consistent layout.
+
+    Parameters
+    ----------
+    shap_vals
+        SHAP values (n_samples, n_features)
+    X
+        Feature dataframe
+    path
+        Output file path
+    plot_kind
+        One of: 'summary', 'bar', 'dependence'
+    feature
+        Required if plot_kind == 'dependence'
+    """
+    plt.figure(figsize=(14, 0.35 * self.max_display))
+
+    if plot_kind == "summary":
+        shap.summary_plot(
+            shap_vals,
+            X,
+            max_display=self.max_display,
+            show=False,
+        )
+
+    elif plot_kind == "bar":
+        shap.summary_plot(
+            shap_vals,
+            X,
+            plot_type="bar",
+            max_display=self.max_display,
+            show=False,
+        )
+
+    elif plot_kind == "dependence":
+        if feature is None:
+            raise ValueError("feature must be provided for dependence plot")
+
+        shap.dependence_plot(
+            feature,
+            shap_vals,
+            X,
+            show=False,
+        )
+
+    else:
+        raise ValueError(f"Unsupported plot_kind: {plot_kind}")
+
+    ax = plt.gca()
+
+    # Reduce y-axis (feature name) font size
+    for label in ax.get_yticklabels():
+        label.set_fontsize(8)
+
+    # Reduce x-axis tick font size
+    for label in ax.get_xticklabels():
+        label.set_fontsize(8)
+
+    # Extra space for long feature names
+    plt.gcf().subplots_adjust(left=0.35)
+
+    plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
+self._save_shap_plot(
+    shap_vals=self.shap_oos,
+    X=self.X_oos,
+    path=output_dir / "dependence_feature_x.png",
+    plot_kind="dependence",
+    feature="feature_x",
+)
+
+
