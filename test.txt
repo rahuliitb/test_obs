@@ -744,3 +744,229 @@ self._save_shap_plot(
 )
 
 
+# ==========================================================
+# Tests for explainability.py
+# ==========================================================
+
+import numpy as np
+import pandas as pd
+import pytest
+import lightgbm as lgb
+from sklearn.datasets import make_classification
+
+from explainability import (
+    compute_lgbm_importance,
+    CVShapExplainer,
+    run_explainability,
+)
+
+
+# ==========================================================
+# Fixtures
+# ==========================================================
+@pytest.fixture(scope="session")
+def small_classification_data():
+    """
+    Create a small dataset with datetime-based grouping
+    to simulate application / snapshot dates.
+    """
+    X, y = make_classification(
+        n_samples=60,
+        n_features=6,
+        n_informative=4,
+        n_redundant=0,
+        random_state=42,
+    )
+
+    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+    y = pd.Series(y, name="target")
+
+    base_date = pd.Timestamp("2020-01-01")
+    groups = pd.Series(
+        [base_date + pd.Timedelta(days=i % 5) for i in range(len(X))],
+        name="group_date",
+    )
+
+    X_it = X.iloc[:40].reset_index(drop=True)
+    y_it = y.iloc[:40].reset_index(drop=True)
+    groups_it = groups.iloc[:40].reset_index(drop=True)
+    X_oot = X.iloc[40:].reset_index(drop=True)
+
+    return X_it, y_it, groups_it, X_oot
+
+
+@pytest.fixture(scope="session")
+def trained_lgbm(small_classification_data):
+    """
+    Train a lightweight LightGBM classifier
+    for SHAP explainability tests.
+    """
+    X_it, y_it, _, _ = small_classification_data
+
+    model = lgb.LGBMClassifier(
+        n_estimators=20,
+        max_depth=3,
+        learning_rate=0.1,
+        random_state=42,
+    )
+    model.fit(X_it, y_it)
+    return model
+
+
+# ==========================================================
+# Tests: helper functions
+# ==========================================================
+def test_compute_lgbm_importance(trained_lgbm):
+    """
+    Ensure LightGBM native importance extraction
+    returns a valid, non-empty DataFrame.
+    """
+    df = compute_lgbm_importance(trained_lgbm)
+
+    assert isinstance(df, pd.DataFrame)
+    assert set(df.columns) == {"feature", "gain", "split"}
+    assert len(df) > 0
+    assert df["gain"].ge(0).all()
+
+
+# ==========================================================
+# Tests: CVShapExplainer core methods
+# ==========================================================
+def test_fit_it(trained_lgbm, small_classification_data):
+    """
+    Verify IT SHAP computation produces
+    correctly shaped SHAP values.
+    """
+    X_it, _, _, _ = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm)
+    explainer.fit_it(X_it)
+
+    assert explainer.shap_it is not None
+    assert explainer.X_it.equals(X_it)
+    assert explainer.shap_it.shape == X_it.shape
+
+
+def test_fit_cv_oos(trained_lgbm, small_classification_data):
+    """
+    Validate CV-OOS SHAP computation using
+    datetime-based GroupKFold.
+    """
+    X_it, y_it, groups, _ = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
+    explainer.fit_cv_oos(X_it, y_it, groups)
+
+    assert explainer.shap_oos is not None
+    assert explainer.X_oos is not None
+    assert explainer.shap_oos.shape == explainer.X_oos.shape
+    assert len(explainer._cv_importances) == 3
+
+
+def test_fit_oot(trained_lgbm, small_classification_data):
+    """
+    Confirm OOT SHAP values are computed
+    using the final fitted model.
+    """
+    _, _, _, X_oot = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm)
+    explainer.fit_oot(X_oot)
+
+    assert explainer.shap_oot is not None
+    assert explainer.X_oot.equals(X_oot)
+
+
+def test_get_lgbm_importance_oos(trained_lgbm, small_classification_data):
+    """
+    Check that OOS LightGBM importances are
+    aggregated correctly across CV folds.
+    """
+    X_it, y_it, groups, _ = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
+    explainer.fit_cv_oos(X_it, y_it, groups)
+
+    df = explainer.get_lgbm_importance("oos")
+
+    assert isinstance(df, pd.DataFrame)
+    assert (df["dataset"] == "oos").all()
+    assert df["gain"].ge(0).all()
+
+
+# ==========================================================
+# Tests: artifact exports
+# ==========================================================
+def test_export_explainability_artifact(
+    trained_lgbm,
+    small_classification_data,
+    tmp_path,
+):
+    """
+    Ensure SHAP plots and LightGBM importance
+    CSVs are written to disk.
+    """
+    X_it, y_it, groups, X_oot = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
+    explainer.fit_it(X_it)
+    explainer.fit_cv_oos(X_it, y_it, groups)
+    explainer.fit_oot(X_oot)
+
+    explainer.export_explainability_artifact(tmp_path)
+
+    assert (tmp_path / "shap_beeswarm_oos.png").exists()
+    assert (tmp_path / "shap_bar_oos.png").exists()
+    assert (tmp_path / "lgbm_importance_oos.csv").exists()
+
+
+def test_export_shap_dependence_plots(
+    trained_lgbm,
+    small_classification_data,
+    tmp_path,
+):
+    """
+    Verify SHAP dependence plots are exported
+    via the CVShapExplainer class method.
+    """
+    X_it, y_it, groups, X_oot = small_classification_data
+
+    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
+    explainer.fit_it(X_it)
+    explainer.fit_cv_oos(X_it, y_it, groups)
+    explainer.fit_oot(X_oot)
+
+    explainer.export_shap_dependence_plots(tmp_path)
+
+    assert (tmp_path / "oos").exists()
+    assert any((tmp_path / "oos").iterdir())
+
+
+# ==========================================================
+# End-to-end smoke test
+# ==========================================================
+def test_run_explainability_smoke(
+    trained_lgbm,
+    small_classification_data,
+    tmp_path,
+):
+    """
+    End-to-end smoke test verifying the full
+    explainability pipeline runs without errors.
+    """
+    X_it, y_it, groups, X_oot = small_classification_data
+
+    explainer = run_explainability(
+        best_model=trained_lgbm,
+        X_it=X_it,
+        y_it=y_it,
+        groups=groups,
+        X_oot=X_oot,
+        output_dir=tmp_path,
+        n_splits=3,
+        max_display=5,
+    )
+
+    assert explainer.shap_oos is not None
+    assert explainer.X_oos is not None
+
