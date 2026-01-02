@@ -1285,3 +1285,146 @@ def test_run_explainability_end_to_end(
 
     # Minimal artifact checks
     assert (cfg.IMAGES_DIR) is not None
+
+
+# ================================
+# Complete single-cell example
+# LightGBM | num_leaves = 3
+# Leaf-level bad rate extraction
+# ================================
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+# ----------------
+# 1. Create data (6% bad rate)
+# ----------------
+np.random.seed(42)
+
+n = 10_000
+bad_rate = 0.06
+
+X = pd.DataFrame({
+    "avg_credit_6m": np.random.normal(60_000, 20_000, n).clip(5_000, 150_000),
+    "txn_volatility": np.random.gamma(2, 1.5, n),
+    "bounce_cnt": np.random.poisson(0.4, n)
+})
+
+y = np.random.binomial(1, bad_rate, n)
+
+print("Overall bad rate:", round(y.mean(), 4))
+
+# ----------------
+# 2. Train LightGBM (max 3 leaves)
+# ----------------
+model = lgb.LGBMClassifier(
+    n_estimators=70,
+    num_leaves=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42
+)
+
+model.fit(X, y)
+
+# ----------------
+# 3. Get leaf indices
+# ----------------
+leaf_indices = model.predict(X, pred_leaf=True)
+
+df_leaf = pd.DataFrame(leaf_indices)
+df_leaf["target"] = y
+
+df_long = df_leaf.melt(
+    id_vars="target",
+    var_name="tree_id",
+    value_name="leaf_id"
+)
+
+# ----------------
+# 4. Compute bad rate per leaf
+# ----------------
+leaf_stats = (
+    df_long
+    .groupby(["tree_id", "leaf_id"])
+    .agg(
+        total_obs=("target", "count"),
+        bads=("target", "sum")
+    )
+    .reset_index()
+)
+
+leaf_stats["bad_rate"] = leaf_stats["bads"] / leaf_stats["total_obs"]
+
+# Filter tiny leaves (important in practice)
+leaf_stats = leaf_stats[leaf_stats["total_obs"] > 50]
+
+# ----------------
+# 5. Extract split paths from model
+# ----------------
+model_dump = model.booster_.dump_model()
+feature_names = model.booster_.feature_name()
+
+def extract_leaf_paths(tree, path, rows, tree_id):
+    if "leaf_index" in tree:
+        rows.append({
+            "tree_id": tree_id,
+            "leaf_id": tree["leaf_index"],
+            "path": " AND ".join(path)
+        })
+    else:
+        f = feature_names[tree["split_feature"]]
+        t = tree["threshold"]
+
+        extract_leaf_paths(
+            tree["left_child"],
+            path + [f"{f} <= {t:.2f}"],
+            rows,
+            tree_id
+        )
+        extract_leaf_paths(
+            tree["right_child"],
+            path + [f"{f} > {t:.2f}"],
+            rows,
+            tree_id
+        )
+
+paths = []
+for i, tree in enumerate(model_dump["tree_info"]):
+    extract_leaf_paths(tree["tree_structure"], [], paths, i)
+
+paths_df = pd.DataFrame(paths)
+
+# ----------------
+# 6. Join paths with bad rates
+# ----------------
+leaf_risk = paths_df.merge(
+    leaf_stats,
+    on=["tree_id", "leaf_id"],
+    how="inner"
+)
+
+print("\nSample leaf-level risk:")
+display(leaf_risk.head(10))
+
+# ----------------
+# 7. Aggregate across trees (final output)
+# ----------------
+summary = (
+    leaf_risk
+    .groupby("path")
+    .agg(
+        trees=("tree_id", "nunique"),
+        avg_bad_rate=("bad_rate", "mean"),
+        min_bad_rate=("bad_rate", "min"),
+        max_bad_rate=("bad_rate", "max"),
+        total_obs=("total_obs", "sum")
+    )
+    .sort_values("avg_bad_rate", ascending=False)
+)
+
+print("\nAggregated risk segments:")
+display(summary.head(10))
+
