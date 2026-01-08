@@ -1428,3 +1428,10 @@ summary = (
 print("\nAggregated risk segments:")
 display(summary.head(10))
 
+
+this slide shows the coefficients of the challenger model.
+The model is a logistic regression trained on WoE-transformed features.
+Because the features are WoE-encoded, the coefficients are directly interpretable in terms of risk direction and strength
+The magnitude of the coefficient reflects the strength of the relationship per unit change in WoE. For example, features with larger absolute coefficients have a stronger impact on reducing default risk when their underlying behavior improves.
+
+To illustrate this, I’ve shown the WoE binning plot for the first feature on the left. As the minimum positive balance increases, the WoE increases monotonically, indicating safer customers. The corresponding coefficient of around minus 0.58 translates this monotonic relationship into a meaningful reduction in default risk.
