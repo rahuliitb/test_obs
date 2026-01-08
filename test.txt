@@ -1,1458 +1,170 @@
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Literal
-
-import matplotlib.pyplot as plt
+# =========================
+# Imports
+# =========================
 import numpy as np
 import pandas as pd
-import shap
-from loguru import logger
-from sklearn.base import clone
+import optuna
+
+from lightgbm import LGBMClassifier, early_stopping
 from sklearn.model_selection import GroupKFold
-
-
-DatasetType = Literal["it", "oos", "oot"]
-
-
-# ------------------------------------------------------------------
-# LightGBM native importance helper
-# ------------------------------------------------------------------
-def compute_lgbm_importance(model) -> pd.DataFrame:
-    if hasattr(model, "booster_"):
-        booster = model.booster_
-    elif hasattr(model, "_Booster"):
-        booster = model._Booster
-    else:
-        raise TypeError("Model does not appear to be a LightGBM model")
-
-    return (
-        pd.DataFrame(
-            {
-                "feature": booster.feature_name(),
-                "gain": booster.feature_importance("gain"),
-                "split": booster.feature_importance("split"),
-            }
-        )
-        .sort_values("gain", ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-# ------------------------------------------------------------------
-# CV SHAP Explainer
-# ------------------------------------------------------------------
-class CVShapExplainer:
-    """
-    Final, minimal, CV-safe explainability pipeline.
-
-    Includes:
-    - SHAP: IT, OOS, OOT
-    - LightGBM native importance: IT, OOS (CV-mean), OOT
-    - Automatic plot + table export
-    """
-
-    def __init__(
-        self,
-        best_model,
-        n_splits: int = 5,
-        max_display: int = 35,
-    ) -> None:
-        self.best_model = best_model
-        self.base_estimator = clone(best_model)
-        self.n_splits = n_splits
-        self.max_display = max_display
-
-        self.shap_it: np.ndarray | None = None
-        self.shap_oos: np.ndarray | None = None
-        self.shap_oot: np.ndarray | None = None
-
-        self.X_it: pd.DataFrame | None = None
-        self.X_oos: pd.DataFrame | None = None
-        self.X_oot: pd.DataFrame | None = None
-
-        self._cv_importances: list[pd.DataFrame] = []
-
-        logger.info(
-            "CVShapExplainer initialized (cv_folds={}, max_display={})",
-            n_splits,
-            max_display,
-        )
-
-    # ------------------------------------------------------------------
-    # IT SHAP (diagnostic)
-    # ------------------------------------------------------------------
-    def fit_it(self, X_it: pd.DataFrame) -> "CVShapExplainer":
-        logger.info("Computing IT SHAP values (rows={})", len(X_it))
-
-        explainer = shap.TreeExplainer(self.best_model)
-        shap_vals = explainer.shap_values(X_it)
-
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[1]  # positive class
-
-        self.shap_it = shap_vals
-        self.X_it = X_it
-
-        return self
-
-    # ------------------------------------------------------------------
-    # CV-OOS SHAP
-    # ------------------------------------------------------------------
-    def fit_cv_oos(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        groups: pd.Series,
-    ) -> "CVShapExplainer":
-        logger.info(
-            "Computing CV-OOS SHAP (folds={}, rows={})",
-            self.n_splits,
-            len(X),
-        )
-
-        gkf = GroupKFold(n_splits=self.n_splits)
-
-        shap_values: list[np.ndarray] = []
-        X_values: list[pd.DataFrame] = []
-
-        for train_idx, val_idx in gkf.split(X, y, groups):
-            model = clone(self.base_estimator)
-            model.fit(X.iloc[train_idx], y.iloc[train_idx])
-
-            explainer = shap.TreeExplainer(model)
-            shap_vals = explainer.shap_values(X.iloc[val_idx])
-
-            if isinstance(shap_vals, list):
-                shap_vals = shap_vals[1]
-
-            shap_values.append(shap_vals)
-            X_values.append(X.iloc[val_idx])
-
-            self._cv_importances.append(
-                compute_lgbm_importance(model)
-            )
-
-        self.shap_oos = np.vstack(shap_values)
-        self.X_oos = pd.concat(X_values, axis=0)
-
-        return self
-
-    # ------------------------------------------------------------------
-    # OOT SHAP
-    # ------------------------------------------------------------------
-    def fit_oot(self, X_oot: pd.DataFrame) -> "CVShapExplainer":
-        logger.info("Computing OOT SHAP values (rows={})", len(X_oot))
-
-        explainer = shap.TreeExplainer(self.best_model)
-        shap_vals = explainer.shap_values(X_oot)
-
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[1]
-
-        self.shap_oot = shap_vals
-        self.X_oot = X_oot
-
-        return self
-
-    # ------------------------------------------------------------------
-    # LightGBM native importance
-    # ------------------------------------------------------------------
-    def get_lgbm_importance(self, dataset: DatasetType) -> pd.DataFrame:
-        if dataset in {"it", "oot"}:
-            df = compute_lgbm_importance(self.best_model)
-
-        elif dataset == "oos":
-            df = (
-                pd.concat(self._cv_importances, axis=0)
-                .groupby("feature", as_index=False)
-                .mean()
-                .sort_values("gain", ascending=False)
-            )
-        else:
-            raise ValueError("dataset must be one of: 'it', 'oos', 'oot'")
-
-        df["dataset"] = dataset
-        return df.reset_index(drop=True)
-
-    # ------------------------------------------------------------------
-    # Explainability artifact export
-    # ------------------------------------------------------------------
-    def export_explainability_artifact(self, output_dir: str | Path) -> None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        if self.shap_oos is None or self.X_oos is None:
-            raise RuntimeError("Run fit_cv_oos before exporting artifacts")
-
-        logger.info("Exporting explainability artifact to {}", output_dir)
-
-        # --------------------
-        # SHAP plots
-        # --------------------
-        for name, shap_vals, X in (
-            ("it", self.shap_it, self.X_it),
-            ("oos", self.shap_oos, self.X_oos),
-            ("oot", self.shap_oot, self.X_oot),
-        ):
-            if shap_vals is None or X is None:
-                continue
-
-            shap.summary_plot(
-                shap_vals,
-                X,
-                max_display=self.max_display,
-                show=False,
-            )
-            plt.savefig(
-                output_dir / f"shap_beeswarm_{name}.png",
-                bbox_inches="tight",
-            )
-            plt.close()
-
-        shap.summary_plot(
-            self.shap_oos,
-            self.X_oos,
-            plot_type="bar",
-            max_display=self.max_display,
-            show=False,
-        )
-        plt.savefig(
-            output_dir / "shap_bar_oos.png",
-            bbox_inches="tight",
-        )
-        plt.close()
-
-        # --------------------
-        # LightGBM importance plots
-        # --------------------
-        for dataset in ("it", "oos", "oot"):
-            df = self.get_lgbm_importance(dataset).head(self.max_display)
-
-            for col in ("gain", "split"):
-                (
-                    df.sort_values(col)
-                    .plot(
-                        kind="barh",
-                        x="feature",
-                        y=col,
-                        figsize=(8, max(4, len(df) * 0.3)),
-                        legend=False,
-                        title=f"LightGBM {col} importance ({dataset})",
-                    )
-                )
-                plt.savefig(
-                    output_dir / f"lgbm_{col}_{dataset}.png",
-                    bbox_inches="tight",
-                )
-                plt.close()
-
-        # --------------------
-        # Tables
-        # --------------------
-        self.get_lgbm_importance("it").to_csv(
-            output_dir / "lgbm_importance_it.csv",
-            index=False,
-        )
-        self.get_lgbm_importance("oos").to_csv(
-            output_dir / "lgbm_importance_oos.csv",
-            index=False,
-        )
-        self.get_lgbm_importance("oot").to_csv(
-            output_dir / "lgbm_importance_oot.csv",
-            index=False,
-        )
-
-        logger.info("Explainability artifact export completed")
-
-
-def run_explainability(
-    best_model,
-    X_it: pd.DataFrame,
-    y_it: pd.Series,
-    groups: pd.Series,
-    X_oot: pd.DataFrame,
-    output_dir: str | Path,
-    *,
-    n_splits: int = 5,
-    max_display: int = 35,
-) -> CVShapExplainer:
-    """
-    Run end-to-end explainability for IT, OOS, and OOT.
-
-    Returns the fitted CVShapExplainer for interactive use.
-    """
-    logger.info("Starting end-to-end explainability run")
-
-    explainer = CVShapExplainer(
-        best_model=best_model,
-        n_splits=n_splits,
-        max_display=max_display,
-    )
-
-    explainer.fit_it(X_it)
-
-
-
-
-# ==========================================================
-# Tests for explainability.py
-# ==========================================================
-
-import numpy as np
-import pandas as pd
-import pytest
-import lightgbm as lgb
+from sklearn.metrics import roc_auc_score
 from sklearn.datasets import make_classification
 
-from explainability import (
-    compute_lgbm_importance,
-    CVShapExplainer,
-    run_explainability,
-)
 
-
-# ==========================================================
-# Fixtures
-# ==========================================================
-@pytest.fixture(scope="session")
-def small_classification_data():
-    """
-    Create a small dataset with datetime-based grouping
-    to simulate application / snapshot dates.
-    """
-    X, y = make_classification(
-        n_samples=60,
-        n_features=6,
-        n_informative=4,
-        n_redundant=0,
-        random_state=42,
-    )
-
-    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-    y = pd.Series(y, name="target")
-
-    base_date = pd.Timestamp("2020-01-01")
-    groups = pd.Series(
-        [base_date + pd.Timedelta(days=i % 5) for i in range(len(X))],
-        name="group_date",
-    )
-
-    X_it = X.iloc[:40].reset_index(drop=True)
-    y_it = y.iloc[:40].reset_index(drop=True)
-    groups_it = groups.iloc[:40].reset_index(drop=True)
-    X_oot = X.iloc[40:].reset_index(drop=True)
-
-    return X_it, y_it, groups_it, X_oot
-
-
-@pytest.fixture(scope="session")
-def trained_lgbm(small_classification_data):
-    """
-    Train a lightweight LightGBM classifier
-    for SHAP explainability tests.
-    """
-    X_it, y_it, _, _ = small_classification_data
-
-    model = lgb.LGBMClassifier(
-        n_estimators=20,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X_it, y_it)
-    return model
-
-
-# ==========================================================
-# Tests: helper functions
-# ==========================================================
-def test_compute_lgbm_importance(trained_lgbm):
-    """
-    Ensure LightGBM native importance extraction
-    returns a valid, non-empty DataFrame.
-    """
-    df = compute_lgbm_importance(trained_lgbm)
-
-    assert isinstance(df, pd.DataFrame)
-    assert set(df.columns) == {"feature", "gain", "split"}
-    assert len(df) > 0
-    assert df["gain"].ge(0).all()
-
-
-# ==========================================================
-# Tests: CVShapExplainer core methods
-# ==========================================================
-def test_fit_it(trained_lgbm, small_classification_data):
-    """
-    Verify IT SHAP computation produces
-    correctly shaped SHAP values.
-    """
-    X_it, _, _, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm)
-    explainer.fit_it(X_it)
-
-    assert explainer.shap_it is not None
-    assert explainer.X_it.equals(X_it)
-    assert explainer.shap_it.shape == X_it.shape
-
-
-def test_fit_cv_oos(trained_lgbm, small_classification_data):
-    """
-    Validate CV-OOS SHAP computation using
-    datetime-based GroupKFold.
-    """
-    X_it, y_it, groups, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
-    assert explainer.shap_oos.shape == explainer.X_oos.shape
-    assert len(explainer._cv_importances) == 3
-
-
-def test_fit_oot(trained_lgbm, small_classification_data):
-    """
-    Confirm OOT SHAP values are computed
-    using the final fitted model.
-    """
-    _, _, _, X_oot = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm)
-    explainer.fit_oot(X_oot)
-
-    assert explainer.shap_oot is not None
-    assert explainer.X_oot.equals(X_oot)
-
-
-def test_get_lgbm_importance_oos(trained_lgbm, small_classification_data):
-    """
-    Check that OOS LightGBM importances are
-    aggregated correctly across CV folds.
-    """
-    X_it, y_it, groups, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-
-    df = explainer.get_lgbm_importance("oos")
-
-    assert isinstance(df, pd.DataFrame)
-    assert (df["dataset"] == "oos").all()
-    assert df["gain"].ge(0).all()
-
-
-# ==========================================================
-# Tests: artifact exports
-# ==========================================================
-def test_export_explainability_artifact(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
+# =========================
+# Optuna + LightGBM (sklearn API) + GroupKFold + Pruning
+# =========================
+def find_best_lgbm_params_sklearn(
+    X_train,
+    y_train,
+    groups,
+    n_trials: int = 30,
+    n_splits: int = 3,
+    random_state: int = 42,
 ):
     """
-    Ensure SHAP plots and LightGBM importance
-    CSVs are written to disk.
+    LightGBM 4.x compatible:
+    - sklearn API (LGBMClassifier)
+    - GroupKFold CV
+    - Optuna pruning
+    - Early stopping via callbacks
+    - Fully reproducible
     """
-    X_it, y_it, groups, X_oot = small_classification_data
 
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_it(X_it)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-    explainer.fit_oot(X_oot)
+    def objective(trial):
 
-    explainer.export_explainability_artifact(tmp_path)
+        params = {
+            # Core
+            "boosting_type": "gbdt",
+            "objective": "binary",
 
-    assert (tmp_path / "shap_beeswarm_oos.png").exists()
-    assert (tmp_path / "shap_bar_oos.png").exists()
-    assert (tmp_path / "lgbm_importance_oos.csv").exists()
+            # Capacity
+            "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.1),
+            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
+            "max_depth": trial.suggest_int("max_depth", 4, 8),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 300),
 
+            # Regularization
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
 
-def test_export_shap_dependence_plots(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    Verify SHAP dependence plots are exported
-    via the CVShapExplainer class method.
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
+            # Subsampling
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 0.9),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 0.9),
+            "bagging_freq": 1,
 
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_it(X_it)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-    explainer.fit_oot(X_oot)
+            # Training control
+            "n_estimators": 1000,  # rely on early stopping
 
-    explainer.export_shap_dependence_plots(tmp_path)
+            # Reproducibility & stability
+            "random_state": random_state,
+            "n_jobs": 1,
+            "deterministic": True,
+            "force_row_wise": True,
+            "feature_pre_filter": False,
+            "verbosity": -1,
+        }
 
-    assert (tmp_path / "oos").exists()
-    assert any((tmp_path / "oos").iterdir())
+        cv = GroupKFold(n_splits=n_splits)
+        aucs = []
 
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            cv.split(X_train, y_train, groups)
+        ):
+            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
 
-# ==========================================================
-# End-to-end smoke test
-# ==========================================================
-def test_run_explainability_smoke(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    End-to-end smoke test verifying the full
-    explainability pipeline runs without errors.
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
+            model = LGBMClassifier(**params)
 
-    explainer = run_explainability(
-        best_model=trained_lgbm,
-        X_it=X_it,
-        y_it=y_it,
-        groups=groups,
-        X_oot=X_oot,
-        output_dir=tmp_path,
-        n_splits=3,
-        max_display=5,
+            model.fit(
+                X_tr,
+                y_tr,
+                eval_set=[(X_val, y_val)],
+                eval_metric="auc",
+                callbacks=[early_stopping(stopping_rounds=50, verbose=False)],
+            )
+
+            preds = model.predict_proba(
+                X_val, num_iteration=model.best_iteration_
+            )[:, 1]
+
+            fold_auc = roc_auc_score(y_val, preds)
+            aucs.append(fold_auc)
+
+            # ---- Optuna pruning (fold-level, CV-safe) ----
+            trial.report(np.mean(aucs), step=fold_idx)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        return float(np.mean(aucs))
+
+    sampler = optuna.samplers.TPESampler(seed=random_state)
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=5,
+        n_warmup_steps=1,
+        interval_steps=1,
     )
 
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+    )
 
-    explainer.fit_cv_oos(X_it, y_it, groups)
-    explainer.fit_oot(X_oot)
+    study.optimize(objective, n_trials=n_trials)
 
-    explainer.export_explainability_artifact(output_dir)
-
-    logger.info("Explainability run completed")
-
-    return explainer
-
-import shutil
-from pathlib import Path
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import shap
-from loguru import logger
-
-
-def export_shap_dependence_plots(
-    explainer: CVShapExplainer,
-    output_dir: str | Path,
-    *,
-    datasets: tuple[str, ...] = ("it", "oos", "oot"),
-    max_features: int = 10,
-) -> None:
-    """
-    Export SHAP dependence plots with automatic interaction coloring.
-
-    If the output directory already exists, it is removed and recreated.
-    Uses existing SHAP values (no interaction values required).
-    """
-    output_dir = Path(output_dir)
-
-    # Clean existing directory (explicit and intentional)
-    if output_dir.exists():
-        logger.info(
-            "Output directory '{}' exists. Removing it.",
-            output_dir,
-        )
-        shutil.rmtree(output_dir)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Exporting SHAP dependence plots (auto-interaction)")
-
-    data_map = {
-        "it": (explainer.shap_it, explainer.X_it),
-        "oos": (explainer.shap_oos, explainer.X_oos),
-        "oot": (explainer.shap_oot, explainer.X_oot),
+    best_params = {
+        **study.best_params,
+        "boosting_type": "gbdt",
+        "objective": "binary",
+        "bagging_freq": 1,
+        "feature_pre_filter": False,
+        "deterministic": True,
+        "force_row_wise": True,
+        "verbosity": -1,
+        "random_state": random_state,
+        "n_jobs": 1,
     }
 
-    for dataset in datasets:
-        shap_vals, X = data_map.get(dataset, (None, None))
-        if shap_vals is None or X is None:
-            logger.debug(
-                "Skipping dataset '{}' (SHAP values not available)",
-                dataset,
-            )
-            continue
+    best_mean_auc = study.best_value
 
-        dataset_dir = output_dir / dataset
-        dataset_dir.mkdir(exist_ok=True)
-
-        # Select top features by mean |SHAP|
-        mean_abs = np.abs(shap_vals).mean(axis=0)
-        top_features = (
-            pd.Series(mean_abs, index=X.columns)
-            .sort_values(ascending=False)
-            .head(max_features)
-            .index
-        )
-
-        logger.info(
-            "Dataset '{}' | exporting dependence plots for {} features",
-            dataset,
-            len(top_features),
-        )
-
-        for feature in top_features:
-            plt.figure()
-            shap.dependence_plot(
-                feature,
-                shap_vals,
-                X,
-                show=False,
-            )
-            plt.savefig(
-                dataset_dir / f"dependence_{feature}.png",
-                bbox_inches="tight",
-            )
-            plt.close()
-
-    logger.info("SHAP dependence plot export completed")
+    return best_params, best_mean_auc, study
 
 
-def _save_shap_summary_plot(
-    self,
-    shap_vals: np.ndarray,
-    X: pd.DataFrame,
-    path: Path,
-    *,
-    plot_type: str | None = None,
-) -> None:
-    """
-    Save a SHAP summary plot with layout fixes for long feature names.
-    """
-    plt.figure(figsize=(14, 0.35 * self.max_display))
+# =========================
+# Small runnable test case
+# =========================
 
-    shap.summary_plot(
-        shap_vals,
-        X,
-        plot_type=plot_type,
-        max_display=self.max_display,
-        show=False,
-    )
-
-    # Reduce font size of feature names
-    ax = plt.gca()
-    for label in ax.get_yticklabels():
-        label.set_fontsize(8)
-
-    # Add space for long feature names
-    plt.gcf().subplots_adjust(left=0.35)
-
-    plt.savefig(path, bbox_inches="tight")
-    plt.close()
-
-    self._save_shap_summary_plot(
-        shap_vals,
-        X,
-        output_dir / f"shap_beeswarm_{name}.png",
-    )
-self._save_shap_summary_plot(
-    self.shap_oos,
-    self.X_oos,
-    output_dir / "shap_bar_oos.png",
-    plot_type="bar",
+# Synthetic binary classification data
+X, y = make_classification(
+    n_samples=1200,
+    n_features=20,
+    n_informative=8,
+    n_redundant=6,
+    n_clusters_per_class=2,
+    weights=[0.7, 0.3],
+    random_state=42,
 )
 
-def _save_shap_plot(
-    self,
-    *,
-    shap_vals: np.ndarray,
-    X: pd.DataFrame,
-    path: Path,
-    plot_kind: Literal["summary", "bar", "dependence"] = "summary",
-    feature: str | None = None,
-) -> None:
-    """
-    Save SHAP plots with consistent layout.
+# Convert to pandas (important for .iloc usage)
+X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
+y = pd.Series(y)
 
-    Parameters
-    ----------
-    shap_vals
-        SHAP values (n_samples, n_features)
-    X
-        Feature dataframe
-    path
-        Output file path
-    plot_kind
-        One of: 'summary', 'bar', 'dependence'
-    feature
-        Required if plot_kind == 'dependence'
-    """
-    plt.figure(figsize=(14, 0.35 * self.max_display))
+# Create group labels (e.g., customer_id)
+groups = np.repeat(np.arange(100), repeats=12)
 
-    if plot_kind == "summary":
-        shap.summary_plot(
-            shap_vals,
-            X,
-            max_display=self.max_display,
-            show=False,
-        )
-
-    elif plot_kind == "bar":
-        shap.summary_plot(
-            shap_vals,
-            X,
-            plot_type="bar",
-            max_display=self.max_display,
-            show=False,
-        )
-
-    elif plot_kind == "dependence":
-        if feature is None:
-            raise ValueError("feature must be provided for dependence plot")
-
-        shap.dependence_plot(
-            feature,
-            shap_vals,
-            X,
-            show=False,
-        )
-
-    else:
-        raise ValueError(f"Unsupported plot_kind: {plot_kind}")
-
-    ax = plt.gca()
-
-    # Reduce y-axis (feature name) font size
-    for label in ax.get_yticklabels():
-        label.set_fontsize(8)
-
-    # Reduce x-axis tick font size
-    for label in ax.get_xticklabels():
-        label.set_fontsize(8)
-
-    # Extra space for long feature names
-    plt.gcf().subplots_adjust(left=0.35)
-
-    plt.savefig(path, bbox_inches="tight")
-    plt.close()
-
-self._save_shap_plot(
-    shap_vals=self.shap_oos,
-    X=self.X_oos,
-    path=output_dir / "dependence_feature_x.png",
-    plot_kind="dependence",
-    feature="feature_x",
+# =========================
+# Run Optuna
+# =========================
+best_params, best_mean_auc, study = find_best_lgbm_params_sklearn(
+    X_train=X,
+    y_train=y,
+    groups=groups,
+    n_trials=20,   # small for demo
+    n_splits=3,
 )
 
-
-# ==========================================================
-# Tests for explainability.py
-# ==========================================================
-
-import numpy as np
-import pandas as pd
-import pytest
-import lightgbm as lgb
-from sklearn.datasets import make_classification
-
-from explainability import (
-    compute_lgbm_importance,
-    CVShapExplainer,
-    run_explainability,
-)
-
-
-# ==========================================================
-# Fixtures
-# ==========================================================
-@pytest.fixture(scope="session")
-def small_classification_data():
-    """
-    Create a small dataset with datetime-based grouping
-    to simulate application / snapshot dates.
-    """
-    X, y = make_classification(
-        n_samples=60,
-        n_features=6,
-        n_informative=4,
-        n_redundant=0,
-        random_state=42,
-    )
-
-    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-    y = pd.Series(y, name="target")
-
-    base_date = pd.Timestamp("2020-01-01")
-    groups = pd.Series(
-        [base_date + pd.Timedelta(days=i % 5) for i in range(len(X))],
-        name="group_date",
-    )
-
-    X_it = X.iloc[:40].reset_index(drop=True)
-    y_it = y.iloc[:40].reset_index(drop=True)
-    groups_it = groups.iloc[:40].reset_index(drop=True)
-    X_oot = X.iloc[40:].reset_index(drop=True)
-
-    return X_it, y_it, groups_it, X_oot
-
-
-@pytest.fixture(scope="session")
-def trained_lgbm(small_classification_data):
-    """
-    Train a lightweight LightGBM classifier
-    for SHAP explainability tests.
-    """
-    X_it, y_it, _, _ = small_classification_data
-
-    model = lgb.LGBMClassifier(
-        n_estimators=20,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X_it, y_it)
-    return model
-
-
-# ==========================================================
-# Tests: helper functions
-# ==========================================================
-def test_compute_lgbm_importance(trained_lgbm):
-    """
-    Ensure LightGBM native importance extraction
-    returns a valid, non-empty DataFrame.
-    """
-    df = compute_lgbm_importance(trained_lgbm)
-
-    assert isinstance(df, pd.DataFrame)
-    assert set(df.columns) == {"feature", "gain", "split"}
-    assert len(df) > 0
-    assert df["gain"].ge(0).all()
-
-
-# ==========================================================
-# Tests: CVShapExplainer core methods
-# ==========================================================
-def test_fit_it(trained_lgbm, small_classification_data):
-    """
-    Verify IT SHAP computation produces
-    correctly shaped SHAP values.
-    """
-    X_it, _, _, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm)
-    explainer.fit_it(X_it)
-
-    assert explainer.shap_it is not None
-    assert explainer.X_it.equals(X_it)
-    assert explainer.shap_it.shape == X_it.shape
-
-
-def test_fit_cv_oos(trained_lgbm, small_classification_data):
-    """
-    Validate CV-OOS SHAP computation using
-    datetime-based GroupKFold.
-    """
-    X_it, y_it, groups, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
-    assert explainer.shap_oos.shape == explainer.X_oos.shape
-    assert len(explainer._cv_importances) == 3
-
-
-def test_fit_oot(trained_lgbm, small_classification_data):
-    """
-    Confirm OOT SHAP values are computed
-    using the final fitted model.
-    """
-    _, _, _, X_oot = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm)
-    explainer.fit_oot(X_oot)
-
-    assert explainer.shap_oot is not None
-    assert explainer.X_oot.equals(X_oot)
-
-
-def test_get_lgbm_importance_oos(trained_lgbm, small_classification_data):
-    """
-    Check that OOS LightGBM importances are
-    aggregated correctly across CV folds.
-    """
-    X_it, y_it, groups, _ = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-
-    df = explainer.get_lgbm_importance("oos")
-
-    assert isinstance(df, pd.DataFrame)
-    assert (df["dataset"] == "oos").all()
-    assert df["gain"].ge(0).all()
-
-
-# ==========================================================
-# Tests: artifact exports
-# ==========================================================
-def test_export_explainability_artifact(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    Ensure SHAP plots and LightGBM importance
-    CSVs are written to disk.
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_it(X_it)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-    explainer.fit_oot(X_oot)
-
-    explainer.export_explainability_artifact(tmp_path)
-
-    assert (tmp_path / "shap_beeswarm_oos.png").exists()
-    assert (tmp_path / "shap_bar_oos.png").exists()
-    assert (tmp_path / "lgbm_importance_oos.csv").exists()
-
-
-def test_export_shap_dependence_plots(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    Verify SHAP dependence plots are exported
-    via the CVShapExplainer class method.
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
-
-    explainer = CVShapExplainer(trained_lgbm, n_splits=3)
-    explainer.fit_it(X_it)
-    explainer.fit_cv_oos(X_it, y_it, groups)
-    explainer.fit_oot(X_oot)
-
-    explainer.export_shap_dependence_plots(tmp_path)
-
-    assert (tmp_path / "oos").exists()
-    assert any((tmp_path / "oos").iterdir())
-
-
-# ==========================================================
-# End-to-end smoke test
-# ==========================================================
-def test_run_explainability_smoke(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    End-to-end smoke test verifying the full
-    explainability pipeline runs without errors.
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
-
-    explainer = run_explainability(
-        best_model=trained_lgbm,
-        X_it=X_it,
-        y_it=y_it,
-        groups=groups,
-        X_oot=X_oot,
-        output_dir=tmp_path,
-        n_splits=3,
-        max_display=5,
-    )
-
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
-
-
-# ==========================================================
-# End-to-end tests for explainability.py
-# ==========================================================
-
-import pandas as pd
-import pytest
-import lightgbm as lgb
-from sklearn.datasets import make_classification
-
-from explainability import run_explainability
-
-
-# ==========================================================
-# Fixtures
-# ==========================================================
-@pytest.fixture(scope="session")
-def small_classification_data():
-    """
-    Create a small dataset with datetime-based grouping
-    to simulate IT / OOS CV / OOT explainability.
-    """
-    X, y = make_classification(
-        n_samples=60,
-        n_features=6,
-        n_informative=4,
-        n_redundant=0,
-        random_state=42,
-    )
-
-    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-    y = pd.Series(y, name="target")
-
-    # Datetime-based grouping (e.g. application date)
-    base_date = pd.Timestamp("2020-01-01")
-    groups = pd.Series(
-        [base_date + pd.Timedelta(days=i % 5) for i in range(len(X))],
-        name="group_date",
-    )
-
-    # IT / OOT split
-    X_it = X.iloc[:40].reset_index(drop=True)
-    y_it = y.iloc[:40].reset_index(drop=True)
-    groups_it = groups.iloc[:40].reset_index(drop=True)
-    X_oot = X.iloc[40:].reset_index(drop=True)
-
-    return X_it, y_it, groups_it, X_oot
-
-
-@pytest.fixture(scope="session")
-def trained_lgbm(small_classification_data):
-    """
-    Train a lightweight LightGBM model
-    for explainability smoke testing.
-    """
-    X_it, y_it, _, _ = small_classification_data
-
-    model = lgb.LGBMClassifier(
-        n_estimators=20,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X_it, y_it)
-    return model
-
-
-# ==========================================================
-# End-to-end explainability test
-# ==========================================================
-def test_run_explainability_end_to_end(
-    trained_lgbm,
-    small_classification_data,
-    tmp_path,
-):
-    """
-    End-to-end explainability smoke test validating:
-
-    - SHAP values exist for IT, OOS, and OOT
-    - SHAP shape contract: (n_samples, n_features)
-    - LightGBM native importance for IT and OOS
-      with non-negative gain and split
-    - Explainability artifacts are written to disk
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
-
-    explainer = run_explainability(
-        best_model=trained_lgbm,
-        X_it=X_it,
-        y_it=y_it,
-        groups=groups,
-        X_oot=X_oot,
-        output_dir=tmp_path,
-        n_splits=3,
-        max_display=5,
-    )
-
-    # --------------------------------------------------
-    # SHAP: IT
-    # --------------------------------------------------
-    assert explainer.shap_it is not None
-    assert explainer.X_it is not None
-    assert explainer.shap_it.shape == explainer.X_it.shape
-
-    # --------------------------------------------------
-    # SHAP: OOS
-    # --------------------------------------------------
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
-    assert explainer.shap_oos.shape == explainer.X_oos.shape
-
-    # --------------------------------------------------
-    # SHAP: OOT
-    # --------------------------------------------------
-    assert explainer.shap_oot is not None
-    assert explainer.X_oot is not None
-    assert explainer.shap_oot.shape == explainer.X_oot.shape
-
-    # --------------------------------------------------
-    # LightGBM native importance: IT
-    # --------------------------------------------------
-    lgbm_it = explainer.get_lgbm_importance("it")
-
-    assert not lgbm_it.empty
-    assert lgbm_it["gain"].ge(0).all()
-    assert lgbm_it["split"].ge(0).all()
-
-    # --------------------------------------------------
-    # LightGBM native importance: OOS
-    # --------------------------------------------------
-    lgbm_oos = explainer.get_lgbm_importance("oos")
-
-    assert not lgbm_oos.empty
-    assert lgbm_oos["gain"].ge(0).all()
-    assert lgbm_oos["split"].ge(0).all()
-
-    # --------------------------------------------------
-    # Minimal artifact checks
-    # --------------------------------------------------
-    assert (tmp_path / "shap_beeswarm_it.png").exists()
-    assert (tmp_path / "shap_beeswarm_oos.png").exists()
-    assert (tmp_path / "shap_beeswarm_oot.png").exists()
-    assert (tmp_path / "lgbm_importance_it.csv").exists()
-    assert (tmp_path / "lgbm_importance_oos.csv").exists()
-
-
-
-
-
-
-# ==========================================================
-# End-to-end tests for run_explainability
-# ==========================================================
-
-import pandas as pd
-import pytest
-import lightgbm as lgb
-from sklearn.datasets import make_classification
-
-from explainability import run_explainability
-from config import Settings   # <-- adjust import if needed
-
-
-# ==========================================================
-# Fixtures
-# ==========================================================
-@pytest.fixture(scope="session")
-def small_classification_data():
-    """
-    Create a small dataset with datetime-based grouping
-    to simulate IT / OOS CV / OOT explainability.
-    """
-    X, y = make_classification(
-        n_samples=60,
-        n_features=6,
-        n_informative=4,
-        n_redundant=0,
-        random_state=42,
-    )
-
-    X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-    y = pd.Series(y, name="target")
-
-    # Datetime-based groups (e.g. application_date)
-    base_date = pd.Timestamp("2020-01-01")
-    groups = pd.Series(
-        [base_date + pd.Timedelta(days=i % 5) for i in range(len(X))],
-        name="group_date",
-    )
-
-    # IT / OOT split
-    X_it = X.iloc[:40].reset_index(drop=True)
-    y_it = y.iloc[:40].reset_index(drop=True)
-    groups_it = groups.iloc[:40].reset_index(drop=True)
-    X_oot = X.iloc[40:].reset_index(drop=True)
-
-    return X_it, y_it, groups_it, X_oot
-
-
-@pytest.fixture(scope="session")
-def trained_lgbm(small_classification_data):
-    """
-    Train a lightweight LightGBM model for explainability tests.
-    """
-    X_it, y_it, _, _ = small_classification_data
-
-    model = lgb.LGBMClassifier(
-        n_estimators=20,
-        max_depth=3,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X_it, y_it)
-    return model
-
-
-@pytest.fixture
-def cfg(tmp_path):
-    """
-    Real Settings object with filesystem paths
-    overridden for safe test execution.
-    """
-    return Settings(
-        IMAGES_DIR=str(tmp_path),
-        data_type="test",
-        folder_name_explainability="explainability",
-        main_parameters={"trx": {"model_id": "model_123"}},
-        # other required fields use defaults
-    )
-
-
-# ==========================================================
-# End-to-end explainability test
-# ==========================================================
-def test_run_explainability_end_to_end(
-    cfg,
-    trained_lgbm,
-    small_classification_data,
-):
-    """
-    End-to-end explainability test validating:
-
-    - SHAP values exist for IT, OOS, and OOT
-    - SHAP shape contract: (n_samples, n_features)
-    - LightGBM native importance for IT and OOS
-      with non-negative gain and split
-    - Explainability artifacts are written to disk
-    """
-    X_it, y_it, groups, X_oot = small_classification_data
-
-    explainer = run_explainability(
-        cfg=cfg,
-        best_model=trained_lgbm,
-        X_it=X_it,
-        y_it=y_it,
-        X_oot=X_oot,
-        groups=groups,
-    )
-
-    # --------------------------------------------------
-    # SHAP: IT
-    # --------------------------------------------------
-    assert explainer.shap_it is not None
-    assert explainer.X_it is not None
-    assert explainer.shap_it.shape == explainer.X_it.shape
-
-    # --------------------------------------------------
-    # SHAP: OOS
-    # --------------------------------------------------
-    assert explainer.shap_oos is not None
-    assert explainer.X_oos is not None
-    assert explainer.shap_oos.shape == explainer.X_oos.shape
-
-    # --------------------------------------------------
-    # SHAP: OOT
-    # --------------------------------------------------
-    assert explainer.shap_oot is not None
-    assert explainer.X_oot is not None
-    assert explainer.shap_oot.shape == explainer.X_oot.shape
-
-    # --------------------------------------------------
-    # LightGBM native importance: IT
-    # --------------------------------------------------
-    lgbm_it = explainer.get_lgbm_importance("it")
-
-    assert not lgbm_it.empty
-    assert lgbm_it["gain"].ge(0).all()
-    assert lgbm_it["split"].ge(0).all()
-
-    # --------------------------------------------------
-    # LightGBM native importance: OOS
-    # --------------------------------------------------
-    lgbm_oos = explainer.get_lgbm_importance("oos")
-
-    assert not lgbm_oos.empty
-    assert lgbm_oos["gain"].ge(0).all()
-    assert lgbm_oos["split"].ge(0).all()
-
-    # --------------------------------------------------
-    # Artifact path validation
-    # --------------------------------------------------
-    output_dir = (
-        cfg.IMAGES_DIR
-        + "/"
-        + cfg.data_type
-        + "/all/"
-        + cfg.main_parameters["trx"]["model_id"]
-        + "/"
-        + cfg.folder_name_explainability
-    )
-
-    output_dir = pd.Path(output_dir) if hasattr(pd, "Path") else None
-
-    # Minimal artifact checks
-    assert (cfg.IMAGES_DIR) is not None
-
-
-# ================================
-# Complete single-cell example
-# LightGBM | num_leaves = 3
-# Leaf-level bad rate extraction
-# ================================
-
-import numpy as np
-import pandas as pd
-import lightgbm as lgb
-
-# ----------------
-# 1. Create data (6% bad rate)
-# ----------------
-np.random.seed(42)
-
-n = 10_000
-bad_rate = 0.06
-
-X = pd.DataFrame({
-    "avg_credit_6m": np.random.normal(60_000, 20_000, n).clip(5_000, 150_000),
-    "txn_volatility": np.random.gamma(2, 1.5, n),
-    "bounce_cnt": np.random.poisson(0.4, n)
-})
-
-y = np.random.binomial(1, bad_rate, n)
-
-print("Overall bad rate:", round(y.mean(), 4))
-
-# ----------------
-# 2. Train LightGBM (max 3 leaves)
-# ----------------
-model = lgb.LGBMClassifier(
-    n_estimators=70,
-    num_leaves=3,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=42
-)
-
-model.fit(X, y)
-
-# ----------------
-# 3. Get leaf indices
-# ----------------
-leaf_indices = model.predict(X, pred_leaf=True)
-
-df_leaf = pd.DataFrame(leaf_indices)
-df_leaf["target"] = y
-
-df_long = df_leaf.melt(
-    id_vars="target",
-    var_name="tree_id",
-    value_name="leaf_id"
-)
-
-# ----------------
-# 4. Compute bad rate per leaf
-# ----------------
-leaf_stats = (
-    df_long
-    .groupby(["tree_id", "leaf_id"])
-    .agg(
-        total_obs=("target", "count"),
-        bads=("target", "sum")
-    )
-    .reset_index()
-)
-
-leaf_stats["bad_rate"] = leaf_stats["bads"] / leaf_stats["total_obs"]
-
-# Filter tiny leaves (important in practice)
-leaf_stats = leaf_stats[leaf_stats["total_obs"] > 50]
-
-# ----------------
-# 5. Extract split paths from model
-# ----------------
-model_dump = model.booster_.dump_model()
-feature_names = model.booster_.feature_name()
-
-def extract_leaf_paths(tree, path, rows, tree_id):
-    if "leaf_index" in tree:
-        rows.append({
-            "tree_id": tree_id,
-            "leaf_id": tree["leaf_index"],
-            "path": " AND ".join(path)
-        })
-    else:
-        f = feature_names[tree["split_feature"]]
-        t = tree["threshold"]
-
-        extract_leaf_paths(
-            tree["left_child"],
-            path + [f"{f} <= {t:.2f}"],
-            rows,
-            tree_id
-        )
-        extract_leaf_paths(
-            tree["right_child"],
-            path + [f"{f} > {t:.2f}"],
-            rows,
-            tree_id
-        )
-
-paths = []
-for i, tree in enumerate(model_dump["tree_info"]):
-    extract_leaf_paths(tree["tree_structure"], [], paths, i)
-
-paths_df = pd.DataFrame(paths)
-
-# ----------------
-# 6. Join paths with bad rates
-# ----------------
-leaf_risk = paths_df.merge(
-    leaf_stats,
-    on=["tree_id", "leaf_id"],
-    how="inner"
-)
-
-print("\nSample leaf-level risk:")
-display(leaf_risk.head(10))
-
-# ----------------
-# 7. Aggregate across trees (final output)
-# ----------------
-summary = (
-    leaf_risk
-    .groupby("path")
-    .agg(
-        trees=("tree_id", "nunique"),
-        avg_bad_rate=("bad_rate", "mean"),
-        min_bad_rate=("bad_rate", "min"),
-        max_bad_rate=("bad_rate", "max"),
-        total_obs=("total_obs", "sum")
-    )
-    .sort_values("avg_bad_rate", ascending=False)
-)
-
-print("\nAggregated risk segments:")
-display(summary.head(10))
-
-
-this slide shows the coefficients of the challenger model.
-The model is a logistic regression trained on WoE-transformed features.
-Because the features are WoE-encoded, the coefficients are directly interpretable in terms of risk direction and strength
-The magnitude of the coefficient reflects the strength of the relationship per unit change in WoE. For example, features with larger absolute coefficients have a stronger impact on reducing default risk when their underlying behavior improves.
-
-To illustrate this, I’ve shown the WoE binning plot for the first feature on the left. As the minimum positive balance increases, the WoE increases monotonically, indicating safer customers. The corresponding coefficient of around minus 0.58 translates this monotonic relationship into a meaningful reduction in default risk.
-
-
-A 1-unit increase in WoE:
-log-odds change
-=
-−
-0.58
-log-odds change=−0.58
-odds ratio
-=
-𝑒
-−
-0.58
-≈
-0.56
-odds ratio=e
-−0.58
-≈0.56
-Business meaning:
-
-For each 1-unit increase in WoE of minimum positive balance, the odds of default decrease by ~44%.
+print("Best mean CV AUC:", round(best_mean_auc, 4))
+print("\nBest parameters:")
+for k, v in best_params.items():
+    print(f"{k}: {v}")
