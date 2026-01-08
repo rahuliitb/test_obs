@@ -1435,3 +1435,24 @@ Because the features are WoE-encoded, the coefficients are directly interpretabl
 The magnitude of the coefficient reflects the strength of the relationship per unit change in WoE. For example, features with larger absolute coefficients have a stronger impact on reducing default risk when their underlying behavior improves.
 
 To illustrate this, I’ve shown the WoE binning plot for the first feature on the left. As the minimum positive balance increases, the WoE increases monotonically, indicating safer customers. The corresponding coefficient of around minus 0.58 translates this monotonic relationship into a meaningful reduction in default risk.
+
+
+A 1-unit increase in WoE:
+log-odds change
+=
+−
+0.58
+log-odds change=−0.58
+odds ratio
+=
+𝑒
+−
+0.58
+≈
+0.56
+odds ratio=e
+−0.58
+≈0.56
+Business meaning:
+
+For each 1-unit increase in WoE of minimum positive balance, the odds of default decrease by ~44%.
