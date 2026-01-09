@@ -1,353 +1,40 @@
-# ================================
-# COMPLETE SINGLE-CELL EXAMPLE
-# LightGBM | Leaf-level risk with NULL routing
-# ================================
-
-import numpy as np
-import pandas as pd
-import lightgbm as lgb
-
-# ----------------
-# 1. Create data (with NULLs)
-# ----------------
-np.random.seed(42)
-
-n = 10_000
-bad_rate = 0.06
-
-X = pd.DataFrame({
-    "avg_credit_6m": np.random.normal(60_000, 20_000, n).clip(5_000, 150_000),
-    "txn_volatility": np.random.gamma(2, 1.5, n),
-    "bounce_cnt": np.random.poisson(0.4, n)
-})
-
-# Inject NULLs (important!)
-X.loc[np.random.choice(n, 600, replace=False), "avg_credit_6m"] = np.nan
-X.loc[np.random.choice(n, 400, replace=False), "txn_volatility"] = np.nan
-
-y = np.random.binomial(1, bad_rate, n)
-
-print("Overall bad rate:", round(y.mean(), 4))
-
-# ----------------
-# 2. Train LightGBM
-# ----------------
-model = lgb.LGBMClassifier(
-    n_estimators=70,
-    num_leaves=3,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=42
-)
-
-model.fit(X, y)
-
-# ----------------
-# 3. Get leaf indices
-# ----------------
-leaf_indices = model.predict(X, pred_leaf=True)
-
-df_leaf = pd.DataFrame(leaf_indices)
-df_leaf["target"] = y
-
-df_long = df_leaf.melt(
-    id_vars="target",
-    var_name="tree_id",
-    value_name="leaf_id"
-)
-
-# ----------------
-# 4. Compute bad rate per leaf
-# ----------------
-leaf_stats = (
-    df_long
-    .groupby(["tree_id", "leaf_id"])
-    .agg(
-        total_obs=("target", "count"),
-        bads=("target", "sum")
-    )
-    .reset_index()
-)
-
-leaf_stats["bad_rate"] = leaf_stats["bads"] / leaf_stats["total_obs"]
-
-leaf_stats = leaf_stats[leaf_stats["total_obs"] > 50]
-
-# ----------------
-# 5. Extract split paths WITH NULL routing
-# ----------------
-model_dump = model.booster_.dump_model()
-feature_names = model.booster_.feature_name()
-
-def extract_leaf_paths(tree, path, rows, tree_id):
-    if "leaf_index" in tree:
-        rows.append({
-            "tree_id": tree_id,
-            "leaf_id": tree["leaf_index"],
-            "path": " AND ".join(path)
-        })
-    else:
-        f = feature_names[tree["split_feature"]]
-        t = tree["threshold"]
-        default_left = tree["default_left"]
-
-        if default_left:
-            left_cond = f"({f} <= {t:.2f} OR {f} IS NULL)"
-            right_cond = f"{f} > {t:.2f}"
-        else:
-            left_cond = f"{f} <= {t:.2f}"
-            right_cond = f"({f} > {t:.2f} OR {f} IS NULL)"
-
-        extract_leaf_paths(
-            tree["left_child"],
-            path + [left_cond],
-            rows,
-            tree_id
-        )
-        extract_leaf_paths(
-            tree["right_child"],
-            path + [right_cond],
-            rows,
-            tree_id
-        )
-
-paths = []
-for i, tree in enumerate(model_dump["tree_info"]):
-    extract_leaf_paths(tree["tree_structure"], [], paths, i)
-
-paths_df = pd.DataFrame(paths)
-
-# ----------------
-# 6. Join paths with bad rates
-# ----------------
-leaf_risk = paths_df.merge(
-    leaf_stats,
-    on=["tree_id", "leaf_id"],
-    how="inner"
-)
-
-print("\nSample leaf-level risk (with NULL handling):")
-display(leaf_risk.head(10))
-
-# ----------------
-# 7. Aggregate across trees (final risk segments)
-# ----------------
-summary = (
-    leaf_risk
-    .groupby("path")
-    .agg(
-        trees=("tree_id", "nunique"),
-        avg_bad_rate=("bad_rate", "mean"),
-        min_bad_rate=("bad_rate", "min"),
-        max_bad_rate=("bad_rate", "max"),
-        total_obs=("total_obs", "sum")
-    )
-    .sort_values("avg_bad_rate", ascending=False)
-)
-
-print("\nAggregated risk segments:")
-display(summary.head(10))
-
-
-
-
-
-
-
-
-
-# ============================================================
-# END-TO-END UNBIASED XGBOOST PIPELINE (SINGLE CELL)
-# ============================================================
-
-import numpy as np
-import pandas as pd
-import optuna
-
-from xgboost import XGBClassifier
-from sklearn.model_selection import GroupKFold, train_test_split
-from sklearn.metrics import roc_auc_score
-from sklearn.datasets import make_classification
-
-
-# ============================================================
-# 1. CONFIG
-# ============================================================
-RANDOM_STATE = 42
-N_ESTIMATORS_MAX = 1000
-EARLY_STOPPING_ROUNDS = 50
-N_SPLITS = 3
-
-
-# ============================================================
-# 2. DATA (IT / OOT)
-# ============================================================
-X, y = make_classification(
-    n_samples=4000,
-    n_features=25,
-    n_informative=10,
-    n_redundant=8,
-    weights=[0.7, 0.3],
-    random_state=RANDOM_STATE,
-)
-
-X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-y = pd.Series(y)
-
-X_it, X_oot, y_it, y_oot = train_test_split(
-    X,
-    y,
-    test_size=0.25,
-    stratify=y,
-    random_state=RANDOM_STATE,
-)
-
-groups_it = np.repeat(np.arange(len(X_it) // 10), 10)[:len(X_it)]
-
-
-# ============================================================
-# 3. OPTUNA SEARCH SPACE
-# ============================================================
-def suggest_xgb_params(trial):
-    return {
-        "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.1),
-        "max_depth": trial.suggest_int("max_depth", 3, 8),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1.0, 10.0),
-        "subsample": trial.suggest_float("subsample", 0.6, 0.9),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
-        "alpha": trial.suggest_float("alpha", 0.0, 5.0),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1.0, 10.0),
-    }
-
-
-# ============================================================
-# 4. CV WITH BEST ITERATION CAPTURE (IT ONLY)
-# ============================================================
-def cv_auc_and_best_iters(X, y, groups, params):
-    cv = GroupKFold(n_splits=N_SPLITS)
-    aucs = []
-    best_iters = []
-
-    for tr_idx, va_idx in cv.split(X, y, groups):
-        model = XGBClassifier(
-            **params,
-            objective="binary:logistic",
-            eval_metric="auc",
-            n_estimators=N_ESTIMATORS_MAX,
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-            tree_method="hist",
-            random_state=RANDOM_STATE,
-            n_jobs=1,
-            verbosity=0,
-        )
-
-        model.fit(
-            X.iloc[tr_idx], y.iloc[tr_idx],
-            eval_set=[(X.iloc[va_idx], y.iloc[va_idx])],
-            verbose=False,
-        )
-
-        preds = model.predict_proba(
-            X.iloc[va_idx],
-            iteration_range=(0, model.best_iteration + 1)
-        )[:, 1]
-
-        aucs.append(roc_auc_score(y.iloc[va_idx], preds))
-        best_iters.append(model.best_iteration)
-
-    return float(np.mean(aucs)), best_iters
-
-
-# ============================================================
-# 5. OPTUNA OBJECTIVE (IT ONLY)
-# ============================================================
-def objective(trial):
-    params = suggest_xgb_params(trial)
-    mean_auc, _ = cv_auc_and_best_iters(X_it, y_it, groups_it, params)
-    return mean_auc
-
-
-study = optuna.create_study(
-    direction="maximize",
-    sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
-)
-
-study.optimize(objective, n_trials=25, show_progress_bar=True)
-
-best_params = study.best_params
-
-
-# ============================================================
-# 6. FINAL N_ESTIMATORS (FROM IT CV ONLY)
-# ============================================================
-cv_auc_tuning, best_iters = cv_auc_and_best_iters(
-    X_it, y_it, groups_it, best_params
-)
-
-final_n_estimators = int(np.median(best_iters))
-
-print("CV AUC (tuning):", round(cv_auc_tuning, 4))
-print("Best iterations per fold:", best_iters)
-print("Final n_estimators (median):", final_n_estimators)
-
-
-# ============================================================
-# 7. FINAL CV AUC (FIXED PARAMETERS, NO EARLY STOPPING)
-# ============================================================
-def compute_final_cv_auc(X, y, groups, params, n_estimators):
-    cv = GroupKFold(n_splits=N_SPLITS)
-    aucs = []
-
-    for tr_idx, va_idx in cv.split(X, y, groups):
-        model = XGBClassifier(
-            **params,
-            objective="binary:logistic",
-            eval_metric="auc",
-            n_estimators=n_estimators,
-            tree_method="hist",
-            random_state=RANDOM_STATE,
-            n_jobs=1,
-            verbosity=0,
-        )
-
-        model.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-        preds = model.predict_proba(X.iloc[va_idx])[:, 1]
-        aucs.append(roc_auc_score(y.iloc[va_idx], preds))
-
-    return float(np.mean(aucs)), float(np.std(aucs))
-
-
-final_cv_mean_auc, final_cv_std_auc = compute_final_cv_auc(
-    X_it, y_it, groups_it, best_params, final_n_estimators
-)
-
-print(f"Final CV AUC (fixed params): {final_cv_mean_auc:.4f} ± {final_cv_std_auc:.4f}")
-
-
-# ============================================================
-# 8. FINAL MODEL FIT (FULL IT)
-# ============================================================
-final_model = XGBClassifier(
-    **best_params,
-    objective="binary:logistic",
-    eval_metric="auc",
-    n_estimators=final_n_estimators,
-    tree_method="hist",
-    random_state=RANDOM_STATE,
-    n_jobs=1,
-    verbosity=0,
-)
-
-final_model.fit(X_it, y_it)
-
-
-# ============================================================
-# 9. IT & OOT AUC (UNBIASED)
-# ============================================================
-it_auc = roc_auc_score(y_it, final_model.predict_proba(X_it)[:, 1])
-oot_auc = roc_auc_score(y_oot, final_model.predict_proba(X_oot)[:, 1])
-
-print("IT AUC:", round(it_auc, 4))
-print("OOT AUC (UNBIASED):", round(oot_auc, 4))
-
+I will provide:
+1) Feature generation code
+2) A list of example features produced by that code
+
+Your task is to write OVERALL FEATURE DOCUMENTATION, not a code explanation.
+
+Please generate the documentation in **Markdown format**.
+
+The document should:
+- Explain the purpose and intent of the feature set
+- Group features conceptually (using the example feature names only for guidance)
+- Describe feature logic at a high level (no implementation details)
+- Explain business / behavioral intuition behind each feature group
+- Describe time windows and aggregations conceptually
+- Explain how missing values, outliers, and edge cases are handled (at a design level)
+- **Discuss potential data leakage risks and how they are mitigated**
+- **Describe feature stability considerations and monitoring expectations**
+- **Explain how the features support model interpretability and explainability**
+- State assumptions, limitations, and model risk considerations
+- Describe how these features should be used and monitored in downstream models
+
+STRICT RULES:
+- Do NOT explain the code line by line
+- Do NOT describe functions, variables, or syntax
+- Do NOT restate or rewrite the code
+- Use example feature names only to infer feature groups, not to explain code logic
+
+Audience:
+- Data scientists
+- Model validation / model risk teams
+- Risk and business stakeholders
+
+Formatting requirements:
+- Use clear Markdown headings (##, ###)
+- Use bullet points where appropriate
+- Include a concise summary table where helpful
+- Keep the language professional, precise, and regulator-friendly
+
+IMPORTANT:
+If you start explaining how the code works technically, STOP and rewrite at a higher, conceptual level.
