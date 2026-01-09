@@ -1,170 +1,150 @@
-# =========================
-# Imports
-# =========================
+# ================================
+# COMPLETE SINGLE-CELL EXAMPLE
+# LightGBM | Leaf-level risk with NULL routing
+# ================================
+
 import numpy as np
 import pandas as pd
-import optuna
+import lightgbm as lgb
 
-from lightgbm import LGBMClassifier, early_stopping
-from sklearn.model_selection import GroupKFold
-from sklearn.metrics import roc_auc_score
-from sklearn.datasets import make_classification
+# ----------------
+# 1. Create data (with NULLs)
+# ----------------
+np.random.seed(42)
 
+n = 10_000
+bad_rate = 0.06
 
-# =========================
-# Optuna + LightGBM (sklearn API) + GroupKFold + Pruning
-# =========================
-def find_best_lgbm_params_sklearn(
-    X_train,
-    y_train,
-    groups,
-    n_trials: int = 30,
-    n_splits: int = 3,
-    random_state: int = 42,
-):
-    """
-    LightGBM 4.x compatible:
-    - sklearn API (LGBMClassifier)
-    - GroupKFold CV
-    - Optuna pruning
-    - Early stopping via callbacks
-    - Fully reproducible
-    """
+X = pd.DataFrame({
+    "avg_credit_6m": np.random.normal(60_000, 20_000, n).clip(5_000, 150_000),
+    "txn_volatility": np.random.gamma(2, 1.5, n),
+    "bounce_cnt": np.random.poisson(0.4, n)
+})
 
-    def objective(trial):
+# Inject NULLs (important!)
+X.loc[np.random.choice(n, 600, replace=False), "avg_credit_6m"] = np.nan
+X.loc[np.random.choice(n, 400, replace=False), "txn_volatility"] = np.nan
 
-        params = {
-            # Core
-            "boosting_type": "gbdt",
-            "objective": "binary",
+y = np.random.binomial(1, bad_rate, n)
 
-            # Capacity
-            "learning_rate": trial.suggest_float("learning_rate", 0.03, 0.1),
-            "num_leaves": trial.suggest_int("num_leaves", 16, 64),
-            "max_depth": trial.suggest_int("max_depth", 4, 8),
-            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 50, 300),
+print("Overall bad rate:", round(y.mean(), 4))
 
-            # Regularization
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 5.0),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
-
-            # Subsampling
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 0.9),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 0.9),
-            "bagging_freq": 1,
-
-            # Training control
-            "n_estimators": 1000,  # rely on early stopping
-
-            # Reproducibility & stability
-            "random_state": random_state,
-            "n_jobs": 1,
-            "deterministic": True,
-            "force_row_wise": True,
-            "feature_pre_filter": False,
-            "verbosity": -1,
-        }
-
-        cv = GroupKFold(n_splits=n_splits)
-        aucs = []
-
-        for fold_idx, (train_idx, val_idx) in enumerate(
-            cv.split(X_train, y_train, groups)
-        ):
-            X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-            y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-
-            model = LGBMClassifier(**params)
-
-            model.fit(
-                X_tr,
-                y_tr,
-                eval_set=[(X_val, y_val)],
-                eval_metric="auc",
-                callbacks=[early_stopping(stopping_rounds=50, verbose=False)],
-            )
-
-            preds = model.predict_proba(
-                X_val, num_iteration=model.best_iteration_
-            )[:, 1]
-
-            fold_auc = roc_auc_score(y_val, preds)
-            aucs.append(fold_auc)
-
-            # ---- Optuna pruning (fold-level, CV-safe) ----
-            trial.report(np.mean(aucs), step=fold_idx)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        return float(np.mean(aucs))
-
-    sampler = optuna.samplers.TPESampler(seed=random_state)
-    pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=5,
-        n_warmup_steps=1,
-        interval_steps=1,
-    )
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=sampler,
-        pruner=pruner,
-    )
-
-    study.optimize(objective, n_trials=n_trials)
-
-    best_params = {
-        **study.best_params,
-        "boosting_type": "gbdt",
-        "objective": "binary",
-        "bagging_freq": 1,
-        "feature_pre_filter": False,
-        "deterministic": True,
-        "force_row_wise": True,
-        "verbosity": -1,
-        "random_state": random_state,
-        "n_jobs": 1,
-    }
-
-    best_mean_auc = study.best_value
-
-    return best_params, best_mean_auc, study
-
-
-# =========================
-# Small runnable test case
-# =========================
-
-# Synthetic binary classification data
-X, y = make_classification(
-    n_samples=1200,
-    n_features=20,
-    n_informative=8,
-    n_redundant=6,
-    n_clusters_per_class=2,
-    weights=[0.7, 0.3],
-    random_state=42,
+# ----------------
+# 2. Train LightGBM
+# ----------------
+model = lgb.LGBMClassifier(
+    n_estimators=70,
+    num_leaves=3,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42
 )
 
-# Convert to pandas (important for .iloc usage)
-X = pd.DataFrame(X, columns=[f"f{i}" for i in range(X.shape[1])])
-y = pd.Series(y)
+model.fit(X, y)
 
-# Create group labels (e.g., customer_id)
-groups = np.repeat(np.arange(100), repeats=12)
+# ----------------
+# 3. Get leaf indices
+# ----------------
+leaf_indices = model.predict(X, pred_leaf=True)
 
-# =========================
-# Run Optuna
-# =========================
-best_params, best_mean_auc, study = find_best_lgbm_params_sklearn(
-    X_train=X,
-    y_train=y,
-    groups=groups,
-    n_trials=20,   # small for demo
-    n_splits=3,
+df_leaf = pd.DataFrame(leaf_indices)
+df_leaf["target"] = y
+
+df_long = df_leaf.melt(
+    id_vars="target",
+    var_name="tree_id",
+    value_name="leaf_id"
 )
 
-print("Best mean CV AUC:", round(best_mean_auc, 4))
-print("\nBest parameters:")
-for k, v in best_params.items():
-    print(f"{k}: {v}")
+# ----------------
+# 4. Compute bad rate per leaf
+# ----------------
+leaf_stats = (
+    df_long
+    .groupby(["tree_id", "leaf_id"])
+    .agg(
+        total_obs=("target", "count"),
+        bads=("target", "sum")
+    )
+    .reset_index()
+)
+
+leaf_stats["bad_rate"] = leaf_stats["bads"] / leaf_stats["total_obs"]
+
+leaf_stats = leaf_stats[leaf_stats["total_obs"] > 50]
+
+# ----------------
+# 5. Extract split paths WITH NULL routing
+# ----------------
+model_dump = model.booster_.dump_model()
+feature_names = model.booster_.feature_name()
+
+def extract_leaf_paths(tree, path, rows, tree_id):
+    if "leaf_index" in tree:
+        rows.append({
+            "tree_id": tree_id,
+            "leaf_id": tree["leaf_index"],
+            "path": " AND ".join(path)
+        })
+    else:
+        f = feature_names[tree["split_feature"]]
+        t = tree["threshold"]
+        default_left = tree["default_left"]
+
+        if default_left:
+            left_cond = f"({f} <= {t:.2f} OR {f} IS NULL)"
+            right_cond = f"{f} > {t:.2f}"
+        else:
+            left_cond = f"{f} <= {t:.2f}"
+            right_cond = f"({f} > {t:.2f} OR {f} IS NULL)"
+
+        extract_leaf_paths(
+            tree["left_child"],
+            path + [left_cond],
+            rows,
+            tree_id
+        )
+        extract_leaf_paths(
+            tree["right_child"],
+            path + [right_cond],
+            rows,
+            tree_id
+        )
+
+paths = []
+for i, tree in enumerate(model_dump["tree_info"]):
+    extract_leaf_paths(tree["tree_structure"], [], paths, i)
+
+paths_df = pd.DataFrame(paths)
+
+# ----------------
+# 6. Join paths with bad rates
+# ----------------
+leaf_risk = paths_df.merge(
+    leaf_stats,
+    on=["tree_id", "leaf_id"],
+    how="inner"
+)
+
+print("\nSample leaf-level risk (with NULL handling):")
+display(leaf_risk.head(10))
+
+# ----------------
+# 7. Aggregate across trees (final risk segments)
+# ----------------
+summary = (
+    leaf_risk
+    .groupby("path")
+    .agg(
+        trees=("tree_id", "nunique"),
+        avg_bad_rate=("bad_rate", "mean"),
+        min_bad_rate=("bad_rate", "min"),
+        max_bad_rate=("bad_rate", "max"),
+        total_obs=("total_obs", "sum")
+    )
+    .sort_values("avg_bad_rate", ascending=False)
+)
+
+print("\nAggregated risk segments:")
+display(summary.head(10))
