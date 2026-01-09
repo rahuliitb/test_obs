@@ -38,3 +38,11 @@ Formatting requirements:
 
 IMPORTANT:
 If you start explaining how the code works technically, STOP and rewrite at a higher, conceptual level.
+
+
+
+This credit risk model uses behavioral features derived from customers’ historical bank transaction data. The features are grouped into five broad categories based on the type of risk signal they capture: balance-based features, transaction amount–based features, counterparty-based features, category-based features, and expert-derived features. Features are generated at both the main borrower (customer) level and, where applicable, the Joint Credit Obligor (JCO) level, allowing the model to capture overall financial behavior as well as shared patterns and dependencies across linked entities.
+
+All features are calculated using historical transactions only, with clear controls in place to avoid data leakage. The application month is fully excluded, and features are generated using transactions observed up to 12 months prior to the application date. Feature values are computed across multiple rolling time windows (1, 3, 6, and 12 months) using a consistent set of summary statistics, including mean, minimum, maximum, sum, standard deviation, count, and correlation-based measures, where applicable.
+
+In addition to time-window-specific aggregates, the feature set includes cross-window comparison features designed to capture changes in behavior over time. These include absolute differences (delta) and percentage change measures between non-overlapping windows (for example, 1–3 months compared to 4–6 months, or 1–6 months compared to 7–12 months). These comparisons are generated consistently across all feature categories and aggregation levels
