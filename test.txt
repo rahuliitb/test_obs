@@ -1,48 +1,33 @@
-I will provide:
-1) Feature generation code
-2) A list of example features produced by that code
+import shap
+import matplotlib.pyplot as plt
+import numpy as np
 
-Your task is to write OVERALL FEATURE DOCUMENTATION, not a code explanation.
+# Compute SHAP values
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X)
 
-Please generate the documentation in **Markdown format**.
+# Create SHAP bar plot (no show)
+plt.figure()
+shap.summary_plot(
+    shap_values,
+    X,
+    plot_type="bar",
+    show=False
+)
 
-The document should:
-- Explain the purpose and intent of the feature set
-- Group features conceptually (using the example feature names only for guidance)
-- Describe feature logic at a high level (no implementation details)
-- Explain business / behavioral intuition behind each feature group
-- Describe time windows and aggregations conceptually
-- Explain how missing values, outliers, and edge cases are handled (at a design level)
-- **Discuss potential data leakage risks and how they are mitigated**
-- **Describe feature stability considerations and monitoring expectations**
-- **Explain how the features support model interpretability and explainability**
-- State assumptions, limitations, and model risk considerations
-- Describe how these features should be used and monitored in downstream models
+# Get current axes
+ax = plt.gca()
 
-STRICT RULES:
-- Do NOT explain the code line by line
-- Do NOT describe functions, variables, or syntax
-- Do NOT restate or rewrite the code
-- Use example feature names only to infer feature groups, not to explain code logic
+# Add labels to bars
+for bar in ax.patches:
+    width = bar.get_width()
+    ax.text(
+        width,
+        bar.get_y() + bar.get_height() / 2,
+        f"{width:.3f}",
+        va="center",
+        ha="left",
+        fontsize=9
+    )
 
-Audience:
-- Data scientists
-- Model validation / model risk teams
-- Risk and business stakeholders
-
-Formatting requirements:
-- Use clear Markdown headings (##, ###)
-- Use bullet points where appropriate
-- Include a concise summary table where helpful
-- Keep the language professional, precise, and regulator-friendly
-
-IMPORTANT:
-If you start explaining how the code works technically, STOP and rewrite at a higher, conceptual level.
-
-
-
-This credit risk model uses behavioral features derived from customers’ historical bank transaction data. The features are grouped into five broad categories based on the type of risk signal they capture: balance-based features, transaction amount–based features, counterparty-based features, category-based features, and expert-derived features. Features are generated at both the main borrower (customer) level and, where applicable, the Joint Credit Obligor (JCO) level, allowing the model to capture overall financial behavior as well as shared patterns and dependencies across linked entities.
-
-All features are calculated using historical transactions only, with clear controls in place to avoid data leakage. The application month is fully excluded, and features are generated using transactions observed up to 12 months prior to the application date. Feature values are computed across multiple rolling time windows (1, 3, 6, and 12 months) using a consistent set of summary statistics, including mean, minimum, maximum, sum, standard deviation, count, and correlation-based measures, where applicable.
-
-In addition to time-window-specific aggregates, the feature set includes cross-window comparison features designed to capture changes in behavior over time. These include absolute differences (delta) and percentage change measures between non-overlapping windows (for example, 1–3 months compared to 4–6 months, or 1–6 months compared to 7–12 months). These comparisons are generated consistently across all feature categories and aggregation levels
+plt.show()
