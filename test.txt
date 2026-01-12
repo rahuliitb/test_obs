@@ -1,33 +1,25 @@
-import shap
+import lightgbm as lgb
 import matplotlib.pyplot as plt
-import numpy as np
 
-# Compute SHAP values
-explainer = shap.TreeExplainer(model)
-shap_values = explainer.shap_values(X)
-
-# Create SHAP bar plot (no show)
-plt.figure()
-shap.summary_plot(
-    shap_values,
-    X,
-    plot_type="bar",
-    show=False
+# Plot importance
+ax = lgb.plot_importance(
+    model,
+    importance_type="gain",
+    max_num_features=20
 )
 
-# Get current axes
-ax = plt.gca()
-
-# Add labels to bars
+# Add values on bars
 for bar in ax.patches:
     width = bar.get_width()
     ax.text(
         width,
         bar.get_y() + bar.get_height() / 2,
-        f"{width:.3f}",
+        f"{width:.2f}",
         va="center",
         ha="left",
         fontsize=9
     )
 
+ax.set_title("LightGBM Feature Importance (Gain)")
+plt.tight_layout()
 plt.show()
