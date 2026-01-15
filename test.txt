@@ -1,25 +1,9 @@
-import lightgbm as lgb
-import matplotlib.pyplot as plt
+At ING Hubs Poland (2024–Present), I work on enterprise-scale credit risk platforms, where I architected PySpark-based ETL pipelines to process billions of transactional records, generating 1,200+ expert-driven and automated features for scalable risk modeling. I developed transaction-based gradient boosting models that improved AUC by ~5% for instant business lending use cases. Beyond classical ML, I also implemented a Retrieval-Augmented Generation (RAG) system using multimodal LLMs, including embedding fine-tuning, which improved retrieval accuracy by ~15% for internal Q&A systems. I actively review and optimize team code, ensuring performance, scalability, and best practices for distributed data workflows.
 
-# Plot importance
-ax = lgb.plot_importance(
-    model,
-    importance_type="gain",
-    max_num_features=20
-)
+Online PSB Loans Limited | Data Scientist (2018–2021)
 
-# Add values on bars
-for bar in ax.patches:
-    width = bar.get_width()
-    ax.text(
-        width,
-        bar.get_y() + bar.get_height() / 2,
-        f"{width:.2f}",
-        va="center",
-        ha="left",
-        fontsize=9
-    )
+During my initial tenure at Online PSB Loans, I worked as a Data Scientist focused on hands-on model development and analytics for MSME and SME lending. I designed and implemented credit risk models using both traditional techniques (Logistic Regression) and advanced feature engineering, incorporating transaction data, bureau data, GST, and income tax information to improve risk differentiation, including for new-to-credit customers. I also contributed to building a scalable analytics data warehouse with 1,000+ risk and behavioral features, significantly reducing downstream feature engineering effort for BI and modeling teams. In parallel, I delivered applied ML solutions such as KYC document intelligence (PII detection and masking) and satellite imagery–based land classification models, gaining strong exposure to end-to-end ML pipelines, AWS-based infrastructure, and production deployment.
 
-ax.set_title("LightGBM Feature Importance (Gain)")
-plt.tight_layout()
-plt.show()
+Online PSB Loans Limited | Senior Data Scientist (2021–2024)
+
+From 2021 onward, I served as a Senior Data Scientist, where my role expanded to technical leadership, solution ownership, and cross-functional coordination. I spearheaded the development of a first-of-its-kind multi-dimensional credit risk ranking model leveraging alternative data sources, which materially improved underwriting decisions and delivered an estimated $57M in business value with ~10% CAGR. This work earned Central Banking’s Open Finance Partner Award and was featured in a Central Banking article for its impact on expanding credit access to MSMEs. I led and mentored junior data scientists, conducted design and code reviews, and worked closely with product, risk, and external partners to translate business requirements into production-grade ML systems. In addition, I drove the adoption of AWS-based MLOps and infrastructure automation, ensuring scalable, reliable deployment of risk models in a regulated lending environment.
