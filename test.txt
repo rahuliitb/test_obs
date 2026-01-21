@@ -1,18 +1,201 @@
-from pyspark.sql.functions import col
-from pyspark.sql.types import NumericType
+from typing import List
+from pyspark.sql import DataFrame as SparkDataFrame
 
-df = df.select([
-    col(c).cast("decimal(18,6)").alias(c)
-    if isinstance(df.schema[c].dataType, NumericType)
-    else col(c)
-    for c in df.columns
-])
+def join_in_chunks(
+    df_list: List[SparkDataFrame],
+    key_col: str,
+    chunk_size: int,
+    base_df: SparkDataFrame
+) -> SparkDataFrame:
+    """
+    Efficiently join a large list of Spark DataFrames on a key column using chunking.
 
-from pyspark.sql.functions import col, round
-from pyspark.sql.types import FloatType, DoubleType
+    Args:
+        df_list (List[SparkDataFrame]): List of Spark DataFrames to join
+        key_col (str): Column name to join on
+        chunk_size (int): Number of Spark DataFrames per chunk
+        base_df (SparkDataFrame): Base DataFrame containing all keys
 
-df = df.select([
-    col(c) if not isinstance(df.schema[c].dataType, (FloatType, DoubleType))
-    else round(col(c), 6).cast("decimal(18,6)").alias(c)
-    for c in df.columns
-])
+    Returns:
+        SparkDataFrame: Spark DataFrame with all features combined
+    """
+    if not df_list:
+        raise ValueError("df_list cannot be empty")
+
+    chunks = [
+        df_list[i:i + chunk_size]
+        for i in range(0, len(df_list), chunk_size)
+    ]
+
+    partial_results = []
+
+    # --------------------------------------------------
+    # Join inside each chunk (LEFT JOIN)
+    # --------------------------------------------------
+    for chunk in chunks:
+        partial = base_df
+
+        for df in chunk:
+            partial = partial.join(df, on=key_col, how="left")
+
+        # Cut lineage aggressively
+        partial = partial.checkpoint(eager=True)
+        partial_results.append(partial)
+
+    # --------------------------------------------------
+    # Join all partial results
+    # --------------------------------------------------
+    final_result = partial_results[0]
+    for df in partial_results[1:]:
+        final_result = final_result.join(df, on=key_col, how="left")
+
+    return final_result
+from pyspark.sql import functions as F
+from pyspark.storagelevel import StorageLevel
+import operator
+
+def create_corr_or_delta_features(
+    month_df: SparkDataFrame,
+    feature_type: str,
+    cfg: Settings
+) -> SparkDataFrame:
+    """
+    Generate autocorrelation or delta features based on monthly aggregated transactions.
+
+    Autocorrelation of monthly values is computed at a time lag of 1 month
+    Delta is the average relative difference between consecutive monthly values
+    Values for feature type: 'correlation' or 'delta'.
+
+    Args:
+        month_df (SparkDataFrame): Spark DataFrame with monthly-aggregated features.
+            Must include columns for application ID and 'difference_in_months'.
+        feature_type (str): Either 'correlation' or 'delta'. Determines which feature to compute.
+        cfg (Settings): Configuration object.
+
+    Returns:
+        SparkDataFrame: Spark DataFrame with new autocorrelation or delta features,
+        joined on application ID.
+    """
+    logger.info(f"Start creating {feature_type} features")
+
+    # --------------------------------------------------
+    # 0. Persist base DataFrame
+    # --------------------------------------------------
+    month_df = month_df.persist(StorageLevel.MEMORY_AND_DISK)
+    _ = month_df.count()
+
+    # Base ID anchor (CRITICAL for LEFT JOIN safety)
+    base_df = month_df.select(cfg.application_id).distinct()
+
+    horizons = cfg.horizons
+    feature_df_list = []
+
+    # --------------------------------------------------
+    # 1. Identify valid feature columns
+    # --------------------------------------------------
+    key_set = {cfg.application_id, "difference_in_months"}
+    all_feature_columns = [c for c in month_df.columns if c not in key_set]
+
+    logger.info(f"{feature_type} - 1. Apply column filtering")
+
+    agg_exprs = [F.countDistinct(F.col(c)).alias(c) for c in all_feature_columns]
+    stats = month_df.agg(*agg_exprs).first().asDict()
+
+    feat_columns = [c for c in all_feature_columns if stats.get(c, 0) > 1]
+
+    # --------------------------------------------------
+    # 2. Feature parameters
+    # --------------------------------------------------
+    feature_class, target_suffix, agg_func, name_replace = get_feature_params(feature_type)
+    prefix_start = "f_trx_m_" if cfg.main_borrower_only else "f_trx_m_jco_"
+
+    logger.info(f"{feature_type} - 2. Create feature fork for each feature")
+
+    # --------------------------------------------------
+    # 3. Feature construction
+    # --------------------------------------------------
+    for idx, col_nm in enumerate(feat_columns, start=1):
+        forker = FeatureForkJoin()
+
+        for horizon in horizons:
+            if horizon == 1:
+                continue
+
+            horizon_str = str(horizon)
+
+            horizon_history_used = (
+                horizon + 1 if (feature_type == "correlation" and horizon != 12) else horizon
+            )
+
+            seq = FeatureSequence()
+
+            seq.add(
+                FilterBinaryConditionalBase(
+                    operator=operator.le,
+                    source1=F.col("difference_in_months"),
+                    source2=F.lit(horizon_history_used),
+                )
+            )
+
+            seq.add(
+                feature_class(
+                    group_id_column=cfg.application_id,
+                    source_column=col_nm,
+                    sort_by="difference_in_months",
+                    target_column=col_nm + target_suffix,
+                )
+            )
+
+            folds = FoldBuilder(
+                prefix=f"{prefix_start}{horizon_str}m_",
+                suffix=""
+            )
+            folds.group(cfg.application_id)
+            folds.columns(col_nm + target_suffix)
+            folds.aggregates(agg_func)
+
+            seq.add(folds.build())
+            forker.add(seq)
+
+        logger.info(f"{feature_type} - 2.{idx} Feature fork: {col_nm}")
+        feature_df_list.append(forker(month_df))
+
+    # --------------------------------------------------
+    # 4. Join all features (LEFT JOIN)
+    # --------------------------------------------------
+    if feature_df_list:
+        logger.info(f"{feature_type} - 3. Join all features (LEFT JOIN)")
+        result = join_in_chunks(
+            feature_df_list,
+            cfg.application_id,
+            chunk_size=15,
+            base_df=base_df
+        )
+    else:
+        result = base_df
+
+    # --------------------------------------------------
+    # 5. Column renaming
+    # --------------------------------------------------
+    logger.info(f"{feature_type} - 4. Column renaming")
+
+    if feature_type == "correlation":
+        rename_map = {
+            c: c.replace("autocorr_min", "corr")
+            for c in result.columns
+            if "autocorr_min" in c
+        }
+    elif feature_type == "delta":
+        rename_map = {
+            c: c.replace("delta_mean", "delta")
+            for c in result.columns
+            if "delta_mean" in c
+        }
+    else:
+        rename_map = {}
+
+    result = result.select(
+        *[F.col(c).alias(rename_map.get(c, c)) for c in result.columns]
+    )
+
+    return result
