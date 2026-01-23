@@ -1,10 +1,19 @@
-env = {
-    "spark_version": spark.version,
-    "spark_build": spark.sparkContext.version,
-    "java_version": spark.sparkContext._jvm.java.lang.System.getProperty("java.version"),
-    "python_version": sys.version,
-    "numpy_version": np.__version__,
-    "arrow_enabled": spark.conf.get("spark.sql.execution.arrow.pyspark.enabled"),
-    "aqe_enabled": spark.conf.get("spark.sql.adaptive.enabled"),
-}
-print(env)
+from pyspark.sql import functions as F
+
+df_merged = df_merged.select(
+    *[
+        (
+            F.floor(F.col(c) * 100) / 100
+        ).alias(c)
+        if c not in [
+            cfg.application_id,
+            "difference_in_months",
+            cfg.main_borrower_flag,
+            "month",
+            "m_num_days_negative_balance"
+        ]
+        else F.col(c)
+        for c in df_merged.columns
+    ]
+)
+
