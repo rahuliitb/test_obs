@@ -1,19 +1,64 @@
+from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import DecimalType
 
-df_merged = df_merged.select(
-    *[
-        (
-            F.floor(F.col(c) * 100) / 100
-        ).alias(c)
-        if c not in [
-            cfg.application_id,
-            "difference_in_months",
-            cfg.main_borrower_flag,
-            "month",
-            "m_num_days_negative_balance"
-        ]
-        else F.col(c)
-        for c in df_merged.columns
-    ]
+spark = SparkSession.builder.getOrCreate()
+
+# -----------------------------
+# Case A: data slightly below boundary
+# -----------------------------
+data_a = [
+    (1, 100.112499999),
+    (2, 373.412499999),
+]
+
+df_a = spark.createDataFrame(data_a, ["id", "amount"])
+
+sum_a = (
+    df_a
+    .agg(F.sum("amount").alias("sum_amount"))
+    .withColumn("sum_decimal_2", F.col("sum_amount").cast(DecimalType(20, 2)))
 )
 
+print("Case A (slightly lower values):")
+sum_a.show(truncate=False)
+
+# -----------------------------
+# Case B: data slightly above boundary
+# -----------------------------
+data_b = [
+    (1, 100.112500001),
+    (2, 373.412500001),
+]
+
+df_b = spark.createDataFrame(data_b, ["id", "amount"])
+
+sum_b = (
+    df_b
+    .agg(F.sum("amount").alias("sum_amount"))
+    .withColumn("sum_decimal_2", F.col("sum_amount").cast(DecimalType(20, 2)))
+)
+
+print("Case B (slightly higher values):")
+sum_b.show(truncate=False)
+
+# -----------------------------
+# Deterministic truncation fix
+# -----------------------------
+sum_a_trunc = (
+    df_a
+    .agg(F.sum("amount").alias("sum_amount"))
+    .withColumn("sum_trunc_2", F.floor(F.col("sum_amount") * 100) / 100)
+)
+
+sum_b_trunc = (
+    df_b
+    .agg(F.sum("amount").alias("sum_amount"))
+    .withColumn("sum_trunc_2", F.floor(F.col("sum_amount") * 100) / 100)
+)
+
+print("Case A with truncation:")
+sum_a_trunc.show(truncate=False)
+
+print("Case B with truncation:")
+sum_b_trunc.show(truncate=False)
