@@ -1,28 +1,23 @@
-## Step 3: Derived Behavioral and Ratio-Based Features
+## 4. Percentage Change (Trend) Features
 
-The table below lists the derived features generated in Step 3.  
-All features are computed **for each defined time window** (e.g. 1–3m, 1–6m, 4–6m, 7–12m, 1–12m) and are aggregated at the **application level**.
+To capture **trends and directional changes** in customer behavior, percentage change features are derived from the aggregated features created in previous steps.
 
-| Feature Name Pattern | Description |
-|---------------------|-------------|
-| `months_zero_or_neg_amount_sum_<window>` | Number of months within the window where net cashflow is zero or negative |
-| `ratio_zero_or_neg_amount_sum_<window>` | Proportion of months within the window where net cashflow is zero or negative |
-| `months_zero_credits_<window>` | Number of months within the window with zero credit inflows |
-| `ratio_zero_credits_<window>` | Proportion of months within the window with zero credit inflows |
-| `months_zero_or_neg_balance_<window>` | Number of months within the window where the minimum balance is zero or negative |
-| `ratio_zero_or_neg_balance_<window>` | Proportion of months within the window where the minimum balance is zero or negative |
-| `balance_trend_corr_<window>` | Correlation between time (month index) and average monthly balance within the window |
-| `m_min_balance_to_mean_m_balance_<window>` | Minimum balance within the window divided by average balance within the window |
-| `loan_repayment_to_turnover_<window>` | Total loan repayment within the window divided by total turnover within the window |
-| `net_tax_paid_to_turnover_<window>` | Net tax paid (tax paid minus tax refunds) within the window divided by total turnover within the window |
-| `tax_paid_to_turnover_<window>` | Total tax paid within the window divided by total turnover within the window |
-| `min_balance_to_turnover_<window>` | Minimum balance within the window divided by total turnover within the window |
-| `mean_m_min_balance_to_mean_m_turnover_<window>` | Average of monthly minimum balances within the window divided by average monthly turnover within the window |
-| `mean_m_utilities_to_mean_m_turnover_<window>` | Average utilities expense within the window divided by average turnover within the window |
+### Window Comparisons
 
----
+Percentage change is computed between predefined window pairs, for example:
+- **1–3 months vs. 4–6 months**
+- **1–6 months vs. 7–12 months**
 
-### Notes
-- `<window>` represents the time window (e.g. `1_3m`, `1_6m`, `4_6m`, `7_12m`, `1_12m`)
-- All ratio-based features use **safe normalization** (division by zero results in null values)
-- These features are designed to be **interpretable and explainable**, directly reflecting observed financial behavior
+This logic is applied **uniformly to all eligible features** generated in Steps 2 and 3.
+
+### Computation Formula
+
+For each feature and window pair `(win1, win2)`, percentage change is computed as:
+
+Percentage Change = ( X_recent − X_historical ) / X_historical
+
+Where:
+- `X_recent` is the feature value from the more recent time window  
+- `X_historical` is the feature value from the earlier historical window  
+
+If the denominator is zero, the percentage change value is set to null.
