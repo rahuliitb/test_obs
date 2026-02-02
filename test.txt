@@ -1,64 +1,190 @@
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.types import DecimalType
+# Transaction-Based Feature Generation
 
-spark = SparkSession.builder.getOrCreate()
+This document describes the methodology used to generate transaction-based features for credit risk modeling. The objective is to capture **customer cashflow behavior, balance health, expense burden, and temporal trends** using transaction data prior to the application date.
 
-# -----------------------------
-# Case A: data slightly below boundary
-# -----------------------------
-data_a = [
-    (1, 100.112499999),
-    (2, 373.412499999),
-]
+All features are computed using transaction history from the **12 months preceding the application month** and are aggregated at the **application level**.
 
-df_a = spark.createDataFrame(data_a, ["id", "amount"])
+---
 
-sum_a = (
-    df_a
-    .agg(F.sum("amount").alias("sum_amount"))
-    .withColumn("sum_decimal_2", F.col("sum_amount").cast(DecimalType(20, 2)))
-)
+## 1. Monthly-Level Feature Construction
 
-print("Case A (slightly lower values):")
-sum_a.show(truncate=False)
+Transaction data is first aggregated at a **monthly level**. For each of the 12 months prior to the application, the following features are computed:
 
-# -----------------------------
-# Case B: data slightly above boundary
-# -----------------------------
-data_b = [
-    (1, 100.112500001),
-    (2, 373.412500001),
-]
+### Amount-Based Features
+- Monthly total credit  
+- Monthly total debit  
+- Monthly total turnover  
 
-df_b = spark.createDataFrame(data_b, ["id", "amount"])
+### Balance-Based Features
+- Average monthly balance  
+- Minimum monthly balance  
+- Maximum monthly balance  
+- Standard deviation of monthly balance  
+- Monthly minimum-to-maximum balance ratio  
 
-sum_b = (
-    df_b
-    .agg(F.sum("amount").alias("sum_amount"))
-    .withColumn("sum_decimal_2", F.col("sum_amount").cast(DecimalType(20, 2)))
-)
+### Category-Level Features
+Monthly transaction amounts are also aggregated for key categories, including but not limited to:
+- Loan repayment  
+- Utilities payments  
+- Tax payments and tax refunds  
 
-print("Case B (slightly higher values):")
-sum_b.show(truncate=False)
+This step results in **12 monthly observations per feature**, forming the base time series for further aggregation.
 
-# -----------------------------
-# Deterministic truncation fix
-# -----------------------------
-sum_a_trunc = (
-    df_a
-    .agg(F.sum("amount").alias("sum_amount"))
-    .withColumn("sum_trunc_2", F.floor(F.col("sum_amount") * 100) / 100)
-)
+---
 
-sum_b_trunc = (
-    df_b
-    .agg(F.sum("amount").alias("sum_amount"))
-    .withColumn("sum_trunc_2", F.floor(F.col("sum_amount") * 100) / 100)
-)
+## 2. Multi-Window Aggregation of Monthly Features
 
-print("Case A with truncation:")
-sum_a_trunc.show(truncate=False)
+To capture financial behavior over different horizons, monthly features are aggregated across **multiple historical windows** (in months prior to application):
 
-print("Case B with truncation:")
-sum_b_trunc.show(truncate=False)
+- 1–3 months  
+- 1–6 months  
+- 4–6 months  
+- 7–12 months  
+- 1–12 months  
+
+For **each window**, monthly values falling within the window are selected and aggregated.
+
+The following statistical aggregations are applied where meaningful:
+- Minimum  
+- Maximum  
+- Mean  
+- Sum  
+
+> **Balance features are excluded from sum aggregation**, as summing balances across months does not have a meaningful financial interpretation.
+
+All eligible aggregations are computed **independently for each window**, ensuring consistent feature representation across short-term, mid-term, and long-term horizons.
+
+### Example: Turnover (Mean)
+
+From the monthly turnover feature, the following window-based features are generated:
+- `1_12m_m_turnover_mean`
+- `1_6m_m_turnover_mean`
+- `1_3m_m_turnover_mean`
+- `4_6m_m_turnover_mean`
+- `7_12m_m_turnover_mean`
+
+Each feature represents the **average monthly turnover within the specified window**.
+
+### Example: Minimum Balance (Minimum)
+
+From the monthly minimum balance feature, the following window-based features are generated:
+- `1_12m_m_min_balance_min`
+- `1_6m_m_min_balance_min`
+- `1_3m_m_min_balance_min`
+- `4_6m_m_min_balance_min`
+- `7_12m_m_min_balance_min`
+
+Each feature represents the **lowest observed monthly minimum balance within the corresponding window**, capturing liquidity stress over different horizons.
+
+---
+
+## 3. Derived Behavioral and Ratio-Based Features
+
+In addition to statistical aggregates, a set of **behavioral and ratio-based features** is derived to capture financial stability, stress, and structural relationships.
+
+All features in this section are computed **independently for each defined time window**, using monthly values within that window.
+
+### Cashflow Stability Indicators
+- Number of months with zero or negative net cashflow  
+- Proportion of such months relative to the window length  
+
+### Credit Activity Consistency
+- Number of months with zero credit inflows  
+- Proportion of months with zero credit inflows  
+
+### Liquidity Stress Indicators
+- Number of months with zero or negative minimum balance  
+- Proportion of months with zero or negative minimum balance  
+
+### Balance Trend Indicator
+- Correlation between the month index and average monthly balance within the window  
+  (positive values indicate improving trends, negative values indicate deterioration)
+
+### Normalized Balance Measures
+- Ratio of minimum balance to average balance within the window  
+
+### Expense and Obligation Ratios
+
+Expense and obligation measures are normalized by business activity for each window.
+
+#### Example: Minimum Balance to Turnover
+
+The following features are generated for all windows:
+- `1_3m_min_balance_to_turnover`
+- `1_6m_min_balance_to_turnover`
+- `4_6m_min_balance_to_turnover`
+- `7_12m_min_balance_to_turnover`
+- `1_12m_min_balance_to_turnover`
+
+Each feature is computed as the **minimum balance observed within the window divided by the total turnover over the same window**.
+
+#### Example: Mean Minimum Balance to Mean Turnover
+
+The following features are generated for all windows:
+- `1_3m_mean_m_min_balance_to_mean_m_turnover`
+- `1_6m_mean_m_min_balance_to_mean_m_turnover`
+- `4_6m_mean_m_min_balance_to_mean_m_turnover`
+- `7_12m_mean_m_min_balance_to_mean_m_turnover`
+- `1_12m_mean_m_min_balance_to_mean_m_turnover`
+
+Each feature represents the **average of monthly minimum balances divided by the average of monthly turnover within the same window**, providing a normalized measure of typical liquidity relative to business activity.
+
+All ratio-based features are computed using **safe normalization**, ensuring divisions by zero result in null values.
+
+---
+
+## 4. Percentage Change (Trend) Features
+
+To capture **changes in behavior over time**, percentage change features are derived by comparing aggregated feature values across adjacent time windows.
+
+For each eligible feature:
+- A more recent window is compared against an earlier historical window  
+- The same feature definition is retained across windows  
+
+Percentage change is computed as:
+
+\[
+\text{Percentage Change} = \frac{X_{recent} - X_{historical}}{X_{historical}}
+\]
+
+Percentage change features are computed **for all eligible aggregated and derived features**, across all defined window pairs.
+
+### Examples from Step 2 (Statistical Aggregates)
+
+- `1_3m_m_turnover_mean_4_6m_m_turnover_mean_pct_change`
+- `1_6m_m_min_balance_min_7_12m_m_min_balance_min_pct_change`
+
+These features capture changes in turnover levels and liquidity stress across time.
+
+### Examples from Step 3 (Derived and Ratio-Based Features)
+
+- `1_3m_min_balance_to_turnover_4_6m_min_balance_to_turnover_pct_change`
+- `1_6m_mean_m_min_balance_to_mean_m_turnover_7_12m_mean_m_min_balance_to_mean_m_turnover_pct_change`
+
+These features capture changes in normalized liquidity and structural financial relationships over time.
+
+---
+
+## 5. Feature Lineage Summary
+
+| Step | Feature Type | Example Feature |
+|-----|-------------|----------------|
+| Step 2 | Window aggregate | `1_3m_m_turnover_mean` |
+| Step 2 | Window aggregate | `7_12m_m_min_balance_min` |
+| Step 3 | Derived ratio | `1_6m_min_balance_to_turnover` |
+| Step 3 | Derived ratio | `1_6m_mean_m_min_balance_to_mean_m_turnover` |
+| Step 4 | Trend feature | `1_3m_m_turnover_mean_4_6m_m_turnover_mean_pct_change` |
+| Step 4 | Trend feature | `1_6m_min_balance_to_turnover_7_12m_min_balance_to_turnover_pct_change` |
+
+---
+
+## 6. Final Feature Set
+
+The final application-level feature set combines:
+- Monthly behavior summaries  
+- Multi-horizon statistical aggregates  
+- Behavioral stability and liquidity stress indicators  
+- Normalized expense and obligation ratios  
+- Percentage change features capturing temporal dynamics  
+
+This structured approach ensures that both **level-based** and **trend-based** signals are consistently available across **all time windows**, supporting robust, interpretable, and validator-friendly credit risk modeling.
