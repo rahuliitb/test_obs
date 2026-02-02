@@ -1,26 +1,28 @@
-## Monthly-Level Feature Construction
+## Step 3: Derived Behavioral and Ratio-Based Features
 
-Transaction data is first aggregated at a **monthly level**.  
-For each of the **12 months prior to the application month**, a wide set of monthly features is generated. In total, **around 72 monthly-level columns** are created at this stage.
+The table below lists the derived features generated in Step 3.  
+All features are computed **for each defined time window** (e.g. 1–3m, 1–6m, 4–6m, 7–12m, 1–12m) and are aggregated at the **application level**.
 
-The lists below show **representative examples** of the types of features computed, rather than an exhaustive list.
+| Feature Name Pattern | Description |
+|---------------------|-------------|
+| `months_zero_or_neg_amount_sum_<window>` | Number of months within the window where net cashflow is zero or negative |
+| `ratio_zero_or_neg_amount_sum_<window>` | Proportion of months within the window where net cashflow is zero or negative |
+| `months_zero_credits_<window>` | Number of months within the window with zero credit inflows |
+| `ratio_zero_credits_<window>` | Proportion of months within the window with zero credit inflows |
+| `months_zero_or_neg_balance_<window>` | Number of months within the window where the minimum balance is zero or negative |
+| `ratio_zero_or_neg_balance_<window>` | Proportion of months within the window where the minimum balance is zero or negative |
+| `balance_trend_corr_<window>` | Correlation between time (month index) and average monthly balance within the window |
+| `m_min_balance_to_mean_m_balance_<window>` | Minimum balance within the window divided by average balance within the window |
+| `loan_repayment_to_turnover_<window>` | Total loan repayment within the window divided by total turnover within the window |
+| `net_tax_paid_to_turnover_<window>` | Net tax paid (tax paid minus tax refunds) within the window divided by total turnover within the window |
+| `tax_paid_to_turnover_<window>` | Total tax paid within the window divided by total turnover within the window |
+| `min_balance_to_turnover_<window>` | Minimum balance within the window divided by total turnover within the window |
+| `mean_m_min_balance_to_mean_m_turnover_<window>` | Average of monthly minimum balances within the window divided by average monthly turnover within the window |
+| `mean_m_utilities_to_mean_m_turnover_<window>` | Average utilities expense within the window divided by average turnover within the window |
 
-### Amount-Based Features (Examples)
-- Monthly total credit  
-- Monthly total debit  
-- Monthly total turnover  
+---
 
-### Balance-Based Features (Examples)
-- Average monthly balance  
-- Minimum monthly balance  
-- Maximum monthly balance  
-- Standard deviation of monthly balance  
-- Monthly minimum-to-maximum balance ratio  
-
-### Category-Level Features (Examples)
-Monthly transaction amounts are also aggregated for key spending and repayment categories, including but not limited to:
-- Loan repayment  
-- Utilities payments  
-- Tax payments and tax refunds  
-
-This step results in **12 monthly observations for each feature**, which together form the foundational time series used in all subsequent aggregation and feature derivation steps.
+### Notes
+- `<window>` represents the time window (e.g. `1_3m`, `1_6m`, `4_6m`, `7_12m`, `1_12m`)
+- All ratio-based features use **safe normalization** (division by zero results in null values)
+- These features are designed to be **interpretable and explainable**, directly reflecting observed financial behavior
