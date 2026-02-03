@@ -1,233 +1,18 @@
-# Counterparty Features — Complete Documentation
+# Counterparty Features — Category B
 
-This document provides comprehensive technical documentation for counterparty-based features, organized by analytical scope:
-- **Category A:** General features computed from **all transaction categories**
-- **Category B:** Concentrated features computed from **filtered transaction categories only**
+**Category-Specific Counterparty Concentration Features**
 
-The key distinction is transaction filtering scope. Category A provides a holistic view of counterparty structure and dynamics, while Category B focuses on category-specific concentration (supplier vs. customer concentration).
+This section documents the technical construction and outputs of category-specific counterparty concentration features computed using configured concentration parameters. All features described here are derived only from a subset of transaction categories and follow a **Top-N concentration framework**.
 
 ---
-
-# Category A — General Counterparty Features
-
-**All Transaction Categories (Unfiltered)**
 
 ## 1. Overview & Approach
 
-We compute counterparty features by analyzing **all transaction categories** over three fixed time horizons: 3 months, 6 months, and 12 months. For each horizon, we separately process **debit transactions** (money going out) and **credit transactions** (money coming in). This gives us transaction counts, amounts, and concentration metrics at both the counterparty and application levels, plus dynamics showing how counterparties change from month to month.
-
----
-
-## 2. Key Definitions & Notation
-
-| Symbol | Definition |
-|--------|-----------|
-| $i$ | Application identifier (`APPLICATION_ID`) |
-| $h$ | Time horizon in months: $h \in \{3, 6, 12\}$ |
-| $dir$ | Transaction direction: `debit` or `credit` (derived from `ITC1`) |
-| $c$ | Counterparty identifier (`CACCT`) |
-| $t$ | Individual transaction record |
-| $m$ | Month index relative to application date (`difference_in_months`) |
-| $D_{i,h}^{dir}(c)$ | Set of transactions matching application $i$, horizon $h$, direction $dir$, and counterparty $c$ |
-
----
-
-## 3. Counterparty Concentration Features
-
-### 3.1 Amount Aggregation
-
-For each application $i$, horizon $h$, transaction direction $dir$, and counterparty $c$:
-
-**Transaction count per counterparty:**
-
-$$
-trx\_count\_per\_cp_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} 1
-$$
-
-**Transaction amount per counterparty:**
-
-$$
-trx\_amount\_per\_cp_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} AMOUNT_t
-$$
-
-### 3.2 Application-Level Totals
-
-$$
-total\_trx\_count_i = \sum_c trx\_count\_per\_cp_{i,c}
-$$
-
-$$
-total\_trx\_amount_i = \sum_c trx\_amount\_per\_cp_{i,c}
-$$
-
-### 3.3 Normalized Counterparty Shares
-
-**Transaction count share:**
-
-$$
-trx\_count\_percentage_{i,c} = \frac{trx\_count\_per\_cp_{i,c}}{total\_trx\_count_i}
-$$
-
-**Transaction amount share:**
-
-$$
-trx\_amount\_percentage_{i,c} = \frac{trx\_amount\_per\_cp_{i,c}}{total\_trx\_amount_i}
-$$
-
-### 3.4 Concentration Metrics
-
-For each $i, h, dir$:
-
-- **Maximum transaction count share:** $\max_c(trx\_count\_percentage_{i,c})$
-- **Maximum transaction amount share:** $\max_c(trx\_amount\_percentage_{i,c})$
-- **Herfindahl–Hirschman Index (count-based):**
-
-$$
-HHI_{i,h}^{dir} = \sum_c (trx\_count\_percentage_{i,c})^2
-$$
-
-- **Number of distinct counterparties:** $|\{c\}|$
-
----
-
-## 4. Monthly Counterparty Dynamics
-
-### 4.1 Monthly Counterparty Sets
-
-For each application $i$ and month $m$:
-
-$$
-CPSet_{i,m} = \{c \mid c \text{ appears in at least one transaction in month } m\}
-$$
-
-$$
-CPCount_{i,m} = |CPSet_{i,m}|
-$$
-
-### 4.2 Month-on-Month Metrics
-
-For consecutive months $m$ and $m-1$:
-
-**Counterparties lost:**
-
-$$
-Lost_{i,m} = |CPSet_{i,m-1} \setminus CPSet_{i,m}|
-$$
-
-**Counterparties gained:**
-
-$$
-Gained_{i,m} = |CPSet_{i,m} \setminus CPSet_{i,m-1}|
-$$
-
-**Churn rate:**
-
-$$
-ChurnRate_{i,m} = \frac{Lost_{i,m}}{|CPSet_{i,m-1}|} \quad (\text{if } |CPSet_{i,m-1}| > 0)
-$$
-
-**Acquisition rate:**
-
-$$
-AcquisitionRate_{i,m} = \frac{Gained_{i,m}}{|CPSet_{i,m-1}|} \quad (\text{if } |CPSet_{i,m-1}| > 0)
-$$
-
-**Net counterparty change:**
-
-$$
-CPDiff_{i,m} = Gained_{i,m} - Lost_{i,m}
-$$
-
-**Growth rate:**
-
-$$
-GrowthRate_{i,m} = AcquisitionRate_{i,m} - ChurnRate_{i,m}
-$$
-
----
-
-## 5. Horizon-Level Aggregation
-
-For each application $i$, horizon $h$, and transaction direction $dir$, monthly metrics are aggregated using:
-
-- mean
-- standard deviation
-- minimum
-- maximum
-
-Metrics aggregated include:
-- Counterparty count
-- Churn rate
-- Acquisition rate
-- Counterparties gained
-- Counterparties lost
-- Net counterparty change
-- Growth rate
-
----
-
-## 6. Feature Naming Convention & Examples
-
-Category A features follow a naming pattern that encodes:
-- Borrower type (main or joint/co-borrower)
-- Horizon (3m, 6m, or 12m)
-- Transaction direction (debit or credit)
-- Metric computed
-- Aggregation type (mean, std, min, max)
-
-### Example 1: Acquisition Rate Volatility
-
-**Feature name:** `f_cp_jco_12m_credit_acquisition_rate_std`
-
-- `f_cp_jco` → counterparty feature for joint/co-borrower
-- `12m` → 12-month horizon
-- `credit` → credit transactions only
-- `acquisition_rate` → metric: monthly rate of new counterparties
-- `std` → standard deviation across months
-
-**Meaning:** Standard deviation of monthly counterparty acquisition rate over 12 months using credit transactions.
-
-### Example 2: Counterparty Count Volatility
-
-**Feature name:** `f_cp_jco_12m_debit_count_of_cp_std`
-
-- `f_cp_jco` → joint/co-borrower
-- `12m` → 12-month horizon
-- `debit` → debit transactions only
-- `count_of_cp` → metric: number of distinct counterparties per month
-- `std` → standard deviation across months
-
-**Meaning:** Standard deviation of monthly distinct counterparty count over 12 months using debit transactions.
-
-### Example 3: Net Counterparty Change
-
-**Feature name:** `f_cp_jco_3m_credit_cp_diff_std`
-
-- `f_cp_jco` → joint/co-borrower
-- `3m` → 3-month horizon
-- `credit` → credit transactions only
-- `cp_diff` → metric: net change (gained minus lost) counterparties per month
-- `std` → standard deviation across months
-
-**Meaning:** Standard deviation of monthly net counterparty change (acquisition minus churn) over 3 months using credit transactions.
-
----
-
----
-
-# Category B — Category-Specific Counterparty Concentration
-
-**Filtered Transaction Categories Only: Category-Specific Concentration Analysis**
-
-## 1. Overview & Approach
-
-**Key Difference from Category A:** Category B features are computed using **only two specific transaction categories**:
+**Filtering Strategy:** We filter transaction data to include only two specific categories:
 - **"Other Expenses"** → Used to compute **supplier-side concentration** (where money goes out)
 - **"Other Income"** → Used to compute **customer-side concentration** (where money comes in)
 
-All other transaction categories are excluded from Category B computation.
-
-**Filtering Strategy:** We filter transaction data to include only these two categories, then analyze concentration across five overlapping windows:
+**Time Windows:** For each filtered category, we analyze concentration across five overlapping windows:
 - (1, 3): Recent 3 months
 - (4, 6): Middle quarter
 - (1, 6): Recent 6 months  
@@ -238,140 +23,57 @@ All other transaction categories are excluded from Category B computation.
 
 ---
 
-## 2. Notation and Definitions
+## 2. Concentration Computation & Feature Generation
 
-| Symbol | Description |
-|--------|-------------|
-| $i$ | Application identifier (`APPLICATION_ID`) |
-| $c$ | Counterparty identifier derived from `CPLNAME` (with fallback to account identifier when missing) |
-| $t$ | Individual transaction record |
-| $m$ | Month index relative to application date (`difference_in_months`) |
-| $w = (s, e)$ | Time window defined by start month $s$ and end month $e$ |
-| $N = 3$ | Number of top counterparties retained per window |
-| $dir$ | Transaction direction: `customer-side` ($\text{ITC1} = 1$) or `supplier-side` ($\text{ITC1} = 0$) |
+**Key Definitions:** Each application has an ID ($i$), counterparties are identified from `CPLNAME` ($c$), individual transactions are tracked ($t$) within time windows ($w$). Transaction direction determines the feature type: money received (customer-side) vs. money paid out (supplier-side).
 
----
+### 2.1 Amount Aggregation
 
-## 3. Category-Filtered Transaction Set
+For each application, window, transaction direction, and counterparty:
 
-The set of category-filtered transactions is denoted:
+**Sum by counterparty:**
+$$\text{amt}_{i,c}^{w,dir} = \sum_{t \in D_{i,w}^{dir}(c)} \text{Amount}_t$$
 
-$$
-D_{i,w}^{dir}(c)
-$$
+**Sum all counterparties:**
+$$\text{total\_amt}_{i}^{w,dir} = \sum_{\text{all counterparties}} \text{amt}_{i,c}^{w,dir}$$
 
-where this represents the set of transactions $t$ satisfying all of:
+### 2.2 Concentration Calculation & Ranking
 
-- $t.\text{APPLICATION\_ID} = i$
-- $t.\text{category} \in \{\text{Other Income, Other Expenses}\}$ ← **KEY FILTER (differs from Category A)**
-- $s \le t.\text{difference\_in\_months} \le e$
-- $t.\text{ITC1} = dir$
-- $t.\text{CPLNAME} = c$ (or fallback identifier when `CPLNAME` is null)
+Calculate concentration share for each counterparty:
 
----
+$$\text{conc}_{i,c}^{w,dir} = \frac{\text{amt}_{i,c}^{w,dir}}{\text{total\_amt}_{i}^{w,dir}}$$
 
-## 4. Time Scope and Windows
+Rank counterparties by concentration (highest to lowest) and retain only **Top 3**.
 
-### 4.1 Lookback Period
+### 2.3 Feature Outputs
 
-Transactions are restricted to the **last 12 months** prior to the application date.
+For each application, window, and rank (1, 2, 3), generate:
 
-### 4.2 Window Definitions
+**Customer-side concentration:** $\text{cust\_conc}_{i,w,k}$ = share of total customer receipts from rank-k counterparty (from "Other Income")
 
-Within the lookback period, features are computed over the following windows:
+**Supplier-side concentration:** $\text{sup\_conc}_{i,w,k}$ = share of total supplier payments to rank-k counterparty (from "Other Expenses")
 
-| Window | Description |
-|--------|-------------|
-| $(1, 3)$ | Months 1–3 |
-| $(1, 6)$ | Months 1–6 |
-| $(4, 6)$ | Months 4–6 |
-| $(7, 12)$ | Months 7–12 |
-| $(1, 12)$ | Months 1–12 |
-
-Each window is processed independently.
+**Total features per window: 6** (3 customer-side + 3 supplier-side)
 
 ---
 
-## 5. Counterparty Amount Aggregation
+## 3. Percentage Change (Trend) Features
 
-For each application $i$, window $w$, transaction direction $dir$, and counterparty $c$:
+Calculate percentage change in concentration features between time periods:
 
-**Total transaction amount per counterparty (from filtered categories only):**
+$$\Delta\% = \frac{\text{Feature}_{w_1} - \text{Feature}_{w_2}}{\text{Feature}_{w_2}}$$
 
-$$
-amt_{i,c}^{w,dir} = \sum_{t \in D_{i,w}^{dir}(c)} TOT_t
-$$
-
-**Application-level totals:**
-
-$$
-total\_amt_{i}^{w,dir} = \sum_c amt_{i,c}^{w,dir}
-$$
+Only percentage change values are retained in the final dataset.
 
 ---
 
-## 6. Counterparty Concentration Calculation
+## 4. Feature Naming Convention
 
-### 6.1 Normalized Concentration Share
+Category B features follow this naming pattern:
 
-For each counterparty $c$:
+**Format:** `cats_inc_<direction>_conc_<rank>_<start>_<end>m`
 
-$$
-conc_{i,c}^{w,dir} = \frac{amt_{i,c}^{w,dir}}{total\_amt_{i}^{w,dir}}
-$$
-
-This represents the share of total category-specific transaction amount contributed by counterparty $c$ within window $w$.
-
-### 6.2 Counterparty Ranking
-
-For each $i, w, dir$:
-
-- Counterparties are ranked in **descending order** of $conc_{i,c}^{w,dir}$
-- Only the **Top-3 counterparties** are retained
-- Let $Rank_{i,c}^{w,dir} \in \{1, 2, 3\}$
-
----
-
-## 7. Feature Outputs
-
-For each application $i$, window $w$, and rank $k \in \{1, 2, 3\}$:
-
-**Customer-side concentration (from "Other Income" only):**
-
-$$
-cust\_conc_{i,w,k} = conc_{i,c_k}^{w,customer}
-$$
-
-**Supplier-side concentration (from "Other Expenses" only):**
-
-$$
-sup\_conc_{i,w,k} = conc_{i,c_k}^{w,supplier}
-$$
-
-Each window produces **6 features**:
-- 3 customer-side concentration features (ranks 1–3)
-- 3 supplier-side concentration features (ranks 1–3)
-
----
-
-## 8. Percentage Change (Trend) Features
-
-After window-level concentration features are computed, percentage change features are derived between selected window pairs.
-
-For two windows $w_1$ and $w_2$:
-
-$$
-\Delta\% = \frac{\text{Feature}_{i,w_1} - \text{Feature}_{i,w_2}}{\text{Feature}_{i,w_2}}
-$$
-
-(Keep blank lines before/after $$ when pasting into Markdown.)
-
----
-
-## Key Differences (Quick Reference)
-
-- Transaction scope: **Category A = all categories**, **Category B = filtered categories only** (`Other Income`, `Other Expenses`).
-- Time framing: **A** uses fixed horizons (3/6/12m); **B** uses 5 overlapping windows within 12m.
-- Output: **A** includes counts, amounts, dynamics, HHI; **B** focuses on Top-3 concentration shares (customer & supplier) plus trend deltas.
-
----
+- `cats_inc`: Category B indicator
+- `<direction>`: `customer` or `supplier`
+- `<rank>`: 1, 2, or 3 (ranking by concentration)
+- `<start>_<end>m`: Window in months
