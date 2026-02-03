@@ -40,35 +40,52 @@ For each application $i$, horizon $h$, transaction direction $dir$, and counterp
 
 **Transaction count per counterparty:**
 
-$$\text{trx\_count\_per\_cp}_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} 1$$
+$$
+trx\_count\_per\_cp_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} 1
+$$
 
 **Transaction amount per counterparty:**
 
-$$\text{trx\_amount\_per\_cp}_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} \text{AMOUNT}_t$$
+$$
+trx\_amount\_per\_cp_{i,c} = \sum_{t \in D_{i,h}^{dir}(c)} AMOUNT_t
+$$
 
 ### 3.2 Application-Level Totals
 
-$$\text{total\_trx\_count}_i = \sum_c \text{trx\_count\_per\_cp}_{i,c}$$
+$$
+total\_trx\_count_i = \sum_c trx\_count\_per\_cp_{i,c}
+$$
 
-$$\text{total\_trx\_amount}_i = \sum_c \text{trx\_amount\_per\_cp}_{i,c}$$
+$$
+total\_trx\_amount_i = \sum_c trx\_amount\_per\_cp_{i,c}
+$$
 
 ### 3.3 Normalized Counterparty Shares
 
 **Transaction count share:**
 
-$$\text{trx\_count\_percentage}_{i,c} = \frac{\text{trx\_count\_per\_cp}_{i,c}}{\text{total\_trx\_count}_i}$$
+$$
+trx\_count\_percentage_{i,c} = \frac{trx\_count\_per\_cp_{i,c}}{total\_trx\_count_i}
+$$
 
 **Transaction amount share:**
 
-$$\text{trx\_amount\_percentage}_{i,c} = \frac{\text{trx\_amount\_per\_cp}_{i,c}}{\text{total\_trx\_amount}_i}$$
+$$
+trx\_amount\_percentage_{i,c} = \frac{trx\_amount\_per\_cp_{i,c}}{total\_trx\_amount_i}
+$$
 
 ### 3.4 Concentration Metrics
 
 For each $i, h, dir$:
 
-- **Maximum transaction count share:** $\max_c(\text{trx\_count\_percentage}_{i,c})$
-- **Maximum transaction amount share:** $\max_c(\text{trx\_amount\_percentage}_{i,c})$
-- **Herfindahl–Hirschman Index (count-based):** $$\text{HHI}_{i,h}^{dir} = \sum_c (\text{trx\_count\_percentage}_{i,c})^2$$
+- **Maximum transaction count share:** $\max_c(trx\_count\_percentage_{i,c})$
+- **Maximum transaction amount share:** $\max_c(trx\_amount\_percentage_{i,c})$
+- **Herfindahl–Hirschman Index (count-based):**
+
+$$
+HHI_{i,h}^{dir} = \sum_c (trx\_count\_percentage_{i,c})^2
+$$
+
 - **Number of distinct counterparties:** $|\{c\}|$
 
 ---
@@ -79,31 +96,53 @@ For each $i, h, dir$:
 
 For each application $i$ and month $m$:
 
-$$\text{CPSet}_{i,m} = \{c \mid c \text{ appears in at least one transaction in month } m\}$$
+$$
+CPSet_{i,m} = \{c \mid c \text{ appears in at least one transaction in month } m\}
+$$
 
-$$\text{CPCount}_{i,m} = |\text{CPSet}_{i,m}|$$
+$$
+CPCount_{i,m} = |CPSet_{i,m}|
+$$
 
 ### 4.2 Month-on-Month Metrics
 
 For consecutive months $m$ and $m-1$:
 
 **Counterparties lost:**
-$$\text{Lost}_{i,m} = |\text{CPSet}_{i,m-1} \setminus \text{CPSet}_{i,m}|$$
+
+$$
+Lost_{i,m} = |CPSet_{i,m-1} \setminus CPSet_{i,m}|
+$$
 
 **Counterparties gained:**
-$$\text{Gained}_{i,m} = |\text{CPSet}_{i,m} \setminus \text{CPSet}_{i,m-1}|$$
+
+$$
+Gained_{i,m} = |CPSet_{i,m} \setminus CPSet_{i,m-1}|
+$$
 
 **Churn rate:**
-$$\text{ChurnRate}_{i,m} = \frac{\text{Lost}_{i,m}}{|\text{CPSet}_{i,m-1}|} \quad (\text{if } |\text{CPSet}_{i,m-1}| > 0)$$
+
+$$
+ChurnRate_{i,m} = \frac{Lost_{i,m}}{|CPSet_{i,m-1}|} \quad (\text{if } |CPSet_{i,m-1}| > 0)
+$$
 
 **Acquisition rate:**
-$$\text{AcquisitionRate}_{i,m} = \frac{\text{Gained}_{i,m}}{|\text{CPSet}_{i,m-1}|} \quad (\text{if } |\text{CPSet}_{i,m-1}| > 0)$$
+
+$$
+AcquisitionRate_{i,m} = \frac{Gained_{i,m}}{|CPSet_{i,m-1}|} \quad (\text{if } |CPSet_{i,m-1}| > 0)
+$$
 
 **Net counterparty change:**
-$$\text{CPDiff}_{i,m} = \text{Gained}_{i,m} - \text{Lost}_{i,m}$$
+
+$$
+CPDiff_{i,m} = Gained_{i,m} - Lost_{i,m}
+$$
 
 **Growth rate:**
-$$\text{GrowthRate}_{i,m} = \text{AcquisitionRate}_{i,m} - \text{ChurnRate}_{i,m}$$
+
+$$
+GrowthRate_{i,m} = AcquisitionRate_{i,m} - ChurnRate_{i,m}
+$$
 
 ---
 
@@ -217,7 +256,9 @@ All other transaction categories are excluded from Category B computation.
 
 The set of category-filtered transactions is denoted:
 
-$$D_{i,w}^{dir}(c)$$
+$$
+D_{i,w}^{dir}(c)
+$$
 
 where this represents the set of transactions $t$ satisfying all of:
 
@@ -226,16 +267,6 @@ where this represents the set of transactions $t$ satisfying all of:
 - $s \le t.\text{difference\_in\_months} \le e$
 - $t.\text{ITC1} = dir$
 - $t.\text{CPLNAME} = c$ (or fallback identifier when `CPLNAME` is null)
-
-Formally:
-
-$$D_{i,w}^{dir}(c) = \left\{ t \mid \begin{align}
-t.\text{APPLICATION\_ID} &= i \\
-t.\text{category} &\in \{\text{Other Income, Other Expenses}\} \\
-s &\le t.\text{month\_diff} \le e \\
-t.\text{ITC1} &= dir \\
-t.\text{group\_col} &= c
-\end{align} \right\}$$
 
 ---
 
@@ -267,11 +298,15 @@ For each application $i$, window $w$, transaction direction $dir$, and counterpa
 
 **Total transaction amount per counterparty (from filtered categories only):**
 
-$$\text{amt}_{i,c}^{w,dir} = \sum_{t \in D_{i,w}^{dir}(c)} \text{TOT}_t$$
+$$
+amt_{i,c}^{w,dir} = \sum_{t \in D_{i,w}^{dir}(c)} TOT_t
+$$
 
 **Application-level totals:**
 
-$$\text{total\_amt}_{i}^{w,dir} = \sum_c \text{amt}_{i,c}^{w,dir}$$
+$$
+total\_amt_{i}^{w,dir} = \sum_c amt_{i,c}^{w,dir}
+$$
 
 ---
 
@@ -281,7 +316,9 @@ $$\text{total\_amt}_{i}^{w,dir} = \sum_c \text{amt}_{i,c}^{w,dir}$$
 
 For each counterparty $c$:
 
-$$\text{conc}_{i,c}^{w,dir} = \frac{\text{amt}_{i,c}^{w,dir}}{\text{total\_amt}_{i}^{w,dir}}$$
+$$
+conc_{i,c}^{w,dir} = \frac{amt_{i,c}^{w,dir}}{total\_amt_{i}^{w,dir}}
+$$
 
 This represents the share of total category-specific transaction amount contributed by counterparty $c$ within window $w$.
 
@@ -289,9 +326,9 @@ This represents the share of total category-specific transaction amount contribu
 
 For each $i, w, dir$:
 
-- Counterparties are ranked in **descending order** of $\text{conc}_{i,c}^{w,dir}$
+- Counterparties are ranked in **descending order** of $conc_{i,c}^{w,dir}$
 - Only the **Top-3 counterparties** are retained
-- Let $\text{Rank}_{i,c}^{w,dir} \in \{1, 2, 3\}$
+- Let $Rank_{i,c}^{w,dir} \in \{1, 2, 3\}$
 
 ---
 
@@ -301,11 +338,15 @@ For each application $i$, window $w$, and rank $k \in \{1, 2, 3\}$:
 
 **Customer-side concentration (from "Other Income" only):**
 
-$$\text{cust\_conc}_{i,w,k} = \text{conc}_{i,c_k}^{w,\text{customer}}$$
+$$
+cust\_conc_{i,w,k} = conc_{i,c_k}^{w,customer}
+$$
 
 **Supplier-side concentration (from "Other Expenses" only):**
 
-$$\text{sup\_conc}_{i,w,k} = \text{conc}_{i,c_k}^{w,\text{supplier}}$$
+$$
+sup\_conc_{i,w,k} = conc_{i,c_k}^{w,supplier}
+$$
 
 Each window produces **6 features**:
 - 3 customer-side concentration features (ranks 1–3)
@@ -319,39 +360,18 @@ After window-level concentration features are computed, percentage change featur
 
 For two windows $w_1$ and $w_2$:
 
-$$\Delta\% = \frac{\text{Feature}_{i,w_1} - \text{Feature}_{i,w_2}}{\text{Feature}_{i,w_2}}$$
+$$
+\Delta\% = \frac{\text{Feature}_{i,w_1} - \text{Feature}_{i,w_2}}{\text{Feature}_{i,w_2}}
+$$
 
-Only percentage change values are retained in the final dataset.
-
----
-
-## 9. Feature Naming Convention & Examples
-
-Category B features follow the structure:
-
-$$\text{cats\_inc\_}\langle\text{customer|supplier}\rangle\text{\_conc\_}\langle\text{rank}\rangle\text{\_}\langle\text{start}\rangle\text{\_}\langle\text{end}\rangle\text{m}$$
-
-### Example
-
-**Feature name:** `cats_inc_supplier_conc_2_7_12m`
-
-**Interpretation:**
-- **Side:** supplier-side concentration (from "Other Expenses" only)
-- **Rank:** 2nd largest counterparty
-- **Window:** months 7–12
-- **Categories:** Other Income and Other Expenses only (differs from Category A which uses all categories)
+(Keep blank lines before/after $$ when pasting into Markdown.)
 
 ---
 
+## Key Differences (Quick Reference)
+
+- Transaction scope: **Category A = all categories**, **Category B = filtered categories only** (`Other Income`, `Other Expenses`).
+- Time framing: **A** uses fixed horizons (3/6/12m); **B** uses 5 overlapping windows within 12m.
+- Output: **A** includes counts, amounts, dynamics, HHI; **B** focuses on Top-3 concentration shares (customer & supplier) plus trend deltas.
+
 ---
-
-## Key Differences Summary
-
-| Aspect | Category A | Category B |
-|--------|-----------|-----------|
-| **Transaction Categories** | All categories (unfiltered) | Only "Other Income" and "Other Expenses" |
-| **Time Horizons** | 3m, 6m, 12m (fixed horizons) | 5 overlapping windows within 12m |
-| **Counterparty Ranking** | All counterparties analyzed | Top-3 counterparties only |
-| **Metrics** | Count, amount, concentration, dynamics (churn, acquisition, growth) | Concentration share only (with trend features) |
-| **Use Case** | Holistic counterparty structure and behavior | Category-specific supplier/customer concentration |
-| **Feature Count** | Multiple per horizon (counts, dynamics aggregations) | 6 per window (3 customer + 3 supplier) |
