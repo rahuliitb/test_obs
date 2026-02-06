@@ -1,79 +1,46 @@
-# Counterparty Features — Category B
+### f_exp_jco_1_12m_min_balance_to_turnover
 
-**Category-Specific Counterparty Concentration Features**
+**Prefix:** `f_exp_jco` – expert feature for joint / co-borrower  
 
-This section documents the technical construction and outputs of category-specific counterparty concentration features computed using configured concentration parameters. All features described here are derived only from a subset of transaction categories and follow a **Top-N concentration framework**.
+**Horizon:** `1_12m` – last 12 months prior to application  
 
----
+**Metric:** `min_balance_to_turnover`  
 
-## 1. Overview & Approach
+**Meaning:**  
+This feature compares the **lowest account balance reached during the last 12 months** with the **total transaction turnover over the same period** for the joint/co-borrower.
 
-**Filtering Strategy:** We filter transaction data to include only two specific categories:
-- **"Other Expenses"** → Used to compute **supplier-side concentration** (where money goes out)
-- **"Other Income"** → Used to compute **customer-side concentration** (where money comes in)
-
-**Time Windows:** For each filtered category, we analyze concentration across five overlapping windows:
-- (1, 3): Recent 3 months
-- (4, 6): Middle quarter
-- (1, 6): Recent 6 months  
-- (7, 12): Earlier period
-- (1, 12): Full 12-month lookback
-
-**Process:** For each window, we identify the **top 3 counterparties** (by transaction volume) and compute their concentration share. This is done separately for each category and time window combination.
+In simple terms, it shows how small the borrower’s lowest balance was relative to the overall size of their cash flows, helping indicate whether periods of low liquidity occurred despite substantial transaction activity.
 
 ---
 
-## 2. Concentration Computation & Feature Generation
+### f_exp_jco_1_12m_m_min_balance_min
 
-**Key Definitions:** Each application has an ID ($i$), counterparties are identified from `CPLNAME` ($c$), individual transactions are tracked ($t$) within time windows ($w$). Transaction direction determines the feature type: money received (customer-side) vs. money paid out (supplier-side).
+**Prefix:** `f_exp_jco` – expert feature for joint / co-borrower  
 
-### 2.1 Amount Aggregation
+**Horizon:** `1_12m` – last 12 months prior to application  
 
-For each application, window, transaction direction, and counterparty:
+**Metric:** `m_min_balance`  
 
-**Sum by counterparty:**
-$$\text{amt}_{i,c}^{w,dir} = \sum_{t \in D_{i,w}^{dir}(c)} \text{Amount}_t$$
+**Aggregation:** `min`  
 
-**Sum all counterparties:**
-$$\text{total\_amt}_{i}^{w,dir} = \sum_{\text{all counterparties}} \text{amt}_{i,c}^{w,dir}$$
+**Meaning:**  
+This feature records the **lowest monthly minimum balance observed across all months in the last 12 months** for the joint/co-borrower.
 
-### 2.2 Concentration Calculation & Ranking
-
-Calculate concentration share for each counterparty:
-
-$$\text{conc}_{i,c}^{w,dir} = \frac{\text{amt}_{i,c}^{w,dir}}{\text{total\_amt}_{i}^{w,dir}}$$
-
-Rank counterparties by concentration (highest to lowest) and retain only **Top 3**.
-
-### 2.3 Feature Outputs
-
-For each application, window, and rank (1, 2, 3), generate:
-
-**Customer-side concentration:** $\text{cust\_conc}_{i,w,k}$ = share of total customer receipts from rank-k counterparty (from "Other Income")
-
-**Supplier-side concentration:** $\text{sup\_conc}_{i,w,k}$ = share of total supplier payments to rank-k counterparty (from "Other Expenses")
-
-**Total features per window: 6** (3 customer-side + 3 supplier-side)
+It represents the most stressed balance level reached during the period, without any normalization or scaling.
 
 ---
 
-## 3. Percentage Change (Trend) Features
+### f_exp_jco_1_3m_mean_m_min_balance_to_mean_m_turnover
 
-Calculate percentage change in concentration features between time periods:
+**Prefix:** `f_exp_jco` – expert feature for joint / co-borrower  
 
-$$\Delta\% = \frac{\text{Feature}_{w_1} - \text{Feature}_{w_2}}{\text{Feature}_{w_2}}$$
+**Horizon:** `1_3m` – last 3 months prior to application  
 
-Only percentage change values are retained in the final dataset.
+**Metric:** `mean_m_min_balance_to_mean_m_turnover`  
+
+**Meaning:**  
+This feature compares the **average of monthly minimum balances** with the **average monthly turnover** over the most recent three months for the joint/co-borrower.
+
+It reflects how the borrower’s typical low balance compares to their typical level of transaction activity, offering a short-term view of liquidity relative to ongoing cash flows.
 
 ---
-
-## 4. Feature Naming Convention
-
-Category B features follow this naming pattern:
-
-**Format:** `cats_inc_<direction>_conc_<rank>_<start>_<end>m`
-
-- `cats_inc`: Category B indicator
-- `<direction>`: `customer` or `supplier`
-- `<rank>`: 1, 2, or 3 (ranking by concentration)
-- `<start>_<end>m`: Window in months
