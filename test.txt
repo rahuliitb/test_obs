@@ -1,7 +1,35 @@
-The difference between In-Time (82.23%) and cross-validated OOS AUC (75.11%) represents an absolute decrease of 7.12 percentage points (approximately 8.7% relative decline).
+## 6. Segment-Level Performance Analysis
 
-For flexible ensemble methods such as gradient boosting (including LightGBM), it is common to observe a noticeable gap between development and cross-validated performance due to the model’s ability to capture complex patterns within the training data. This difference is generally interpreted as expected in-sample optimism rather than structural overfitting, provided that cross-validated (OOS) and Out-of-Time (OOT) performance remain comparable.
+In addition to overall model performance, discriminatory power was evaluated across key portfolio segments to assess consistency and robustness within different sub-populations.
 
-The Out-of-Time AUC (74.50%) is closely aligned with the cross-validated OOS estimate (75.11%), with a difference of 0.61 percentage points.
+Segment-level analysis ensures that the model does not disproportionately underperform within specific customer groups and that predictive performance remains stable across relevant business dimensions.
 
-Overall, the consistency between OOS and OOT performance indicates that the model generalizes appropriately and maintains stable discriminatory power when applied to future data. The observed IT–OOS gap does not suggest material overfitting.
+### 6.1 Segmentation Dimensions
+
+The following segmentation variables were used:
+
+- **LEGAL FORM**
+- **LOO Before**
+- **LOO After**
+- **Total Transaction Count**
+- **IS_JCO** (Joint / Co-obligor indicator)
+- **Product Type**
+- **Segment**
+
+For each segmentation variable, AUC was computed independently within each subgroup.
+
+### 6.2 Evaluation Approach
+
+Within each segment:
+
+- The model’s AUC was calculated using the same evaluation methodology as the overall portfolio.
+- Performance differences across subgroups were compared.
+- Particular attention was given to identifying any material deterioration in discriminatory power within specific segments.
+
+### 6.3 Interpretation
+
+The segment-level analysis indicates that the model maintains comparable discriminatory power across the evaluated subgroups. While minor variations in AUC are observed between segments, no segment exhibits a disproportionate decline in performance relative to the overall portfolio.
+
+This consistency across key business dimensions supports the robustness of the model and reduces the risk of segment-specific instability.
+
+Overall, the segment analysis confirms that the model’s predictive performance is not concentrated in a single sub-population and remains broadly stable across the portfolio.
