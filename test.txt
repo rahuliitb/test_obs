@@ -1,174 +1,100 @@
-# Explainability
+# Model Evaluation
 
-This section describes the explainability framework used to interpret the predictions of the **LightGBM-based model**. The objective is to ensure transparency, robustness, and business interpretability by clearly identifying **which features drive the model, how they influence predictions, and whether these effects remain stable over time**
+This section describes the framework used to evaluate model performance. The evaluation focuses on discriminatory power, calibration quality, stability over time, and consistency across portfolio segments.
 
-Explainability is evaluated using three complementary views:
+Model performance is assessed using a time-aware data split to evaluate robustness, generalization, and stability when applied to future data.
 
-1. **LightGBM gain-based feature importance** – model learning perspective  
-2. **Mean SHAP values** – global feature influence  
-3. **SHAP beeswarm plots** – direction and distribution of feature effects  
----
-
-## 1. LightGBM Gain-Based Feature Importance (IT)
-
-**Reference image:**  
-`docs/images/explainability/lightgbm_gain_it.png`
-
-Gain-based importance measures the **total reduction in training loss** contributed by a feature across all tree splits in which it appears. A higher gain indicates that the feature plays a more important role in improving model performance during training.
-
-### Key observations
-
-* **Liquidity and balance-related features** dominate gain-based importance, particularly short-term minimum balance relative to turnover.
-* **Tax payment behavior**, **loan repayment debits**, and **utility-related expenses** also contribute materially to model learning.
-* The presence of **multiple time windows (3m, 6m, 12m)** indicates that the model leverages both short-term stress signals and longer-term financial behavior.
-
-
-
-However, gain-based importance:
-
-* Does **not** provide direction of impact
-* Does **not** distinguish stable vs time-sensitive effects
-
-For this reason, SHAP analysis is used as the primary explainability layer.
-
-
-
+- **In-Time (IT):** Dataset used for model development.  
+- **Out-of-Sample (OOS):** Estimated using cross-validation within the In-Time dataset.  
+- **Out-of-Time (OOT):** Separate dataset from a later time period used to assess forward-looking stability.
 
 ---
 
-## 2. Mean SHAP Feature Importance (IT and OOT)
+## 1. Sample Composition
 
-**Reference images:**  
-- IT: `docs/images/explainability/shap_mean_it.png`  
-- OOT: `docs/images/explainability/shap_mean_oot.png`
+The table below summarizes the distribution of good and bad observations across the main evaluation datasets.
 
+| Dataset | Total Observations | Good Count | Bad Count | Bad Rate (%) |
+|----------|------------------|------------|-----------|--------------|
+| In-Time (IT) | 50,000 | 47,000 | 3,000 | 6.00 |
+| Out-of-Time (OOT) | 20,000 | 18,600 | 1,400 | 7.00 |
 
-The **mean absolute SHAP value** measures the average magnitude of impact a feature has on the model’s predictions, regardless of direction. It is computed by taking the SHAP value of that feature for each observation, converting each value to its absolute value, and then averaging across all observations in the dataset.
-
-Formally, for feature *j*:
-
-\[
-\text{mean}(|\text{SHAP}_j|) = \frac{1}{N} \sum_{i=1}^{N} |\text{SHAP}_{ij}|
-\]
-
-where:
-
-- \(N\) = number of samples  
-- \(\text{SHAP}_{ij}\) = SHAP value of feature *j* for sample *i*
-
-
-#### IT vs OOT consistency
-
-* The **ranking and relative magnitude of top features remain highly consistent** between IT and OOT.
-* Liquidity ratios, loan repayment behavior, tax-related debits, and balance sustainability remain dominant drivers across time.
-* No material reordering or collapse of importance is observed in OOT.
-
-#### Interpretation
-
-This stability indicates that:
-
-* The model is **not overfitting to period-specific patterns**
-* Core risk drivers remain **structurally relevant over time**
-* The model generalizes well to unseen data
-
+> *Note: Counts shown above are illustrative placeholders and should be replaced with final portfolio statistics.*
 
 ---
 
-## 3. SHAP Beeswarm Plots (Direction and Distribution)
+## 2. Discriminatory Power – AUC
 
-**Reference images:**  
-- IT: `docs/images/explainability/shap_beeswarm_it.png`  
-- OOT: `docs/images/explainability/shap_beeswarm_oot.png`
+The primary metric used to assess discriminatory power is the **Area Under the ROC Curve (AUC)**.
 
-SHAP beeswarm plots visualize the **distribution and direction** of feature contributions across all observations. 
-The **SHAP beeswarm plot** shows how feature values influence model predictions — not just how important the features are, but also **in which direction** and **by how much** they affect the output.
+AUC measures the model’s ability to correctly rank defaulted observations higher than non-defaulted observations.
 
-Each dot in the plot represents one observation for one feature.
+### 2.1 AUC Comparison Across Datasets
 
-**How to read the plot:**
+| Dataset | AUC (%) | Confidence Interval | Notes |
+|----------|----------|--------------------|-------|
+| In-Time (IT) | 82.23 | — | Development sample |
+| OOS (Cross-Validated) | 75.11 | ± 2.72 | Cross-validated within IT |
+| Out-of-Time (OOT) | 74.50 | [70.55, 78.31] | Future period validation sample |
 
-- **Y-axis**: Features, sorted by global importance (mean absolute SHAP value)
-- **Each point**: One sample’s SHAP value for that feature
-- **X-axis**: Impact on model output  
-  - Right side → pushes prediction higher  
-  - Left side → pushes prediction lower
-- **Color**: Original feature value  
-  - Blue → low feature value  
-  - Red → high feature value
+The difference between IT and cross-validated OOS AUC is 7.12 percentage points. The difference between OOS and OOT AUC is 0.61 percentage points.
 
-**What it helps you understand:**
-
-- Whether high feature values increase or decrease predictions
-- How consistent the feature’s effect is across samples
-- Whether the relationship looks linear, monotonic, or mixed
-- Presence of interaction effects (wide horizontal spread at same color)
-
-**Typical patterns:**
-
-- If red points are mostly on the right and blue on the left → higher values increase predictions
-- If red points are mostly on the left and blue on the right → higher values decrease predictions
-- If colors are mixed across both sides → non-linear or interaction effects may exist
-
-
-#### IT vs OOT comparison
-
-* Directional patterns remain **consistent between IT and OOT beeswarm plots**
-* No sign reversals or structural changes are observed
-* Feature effects remain monotonic and intuitive
-
+The alignment between OOS and OOT performance indicates that the model maintains stable discriminatory power when applied to future data. While In-Time performance is higher than cross-validated performance, this pattern is consistent with expected in-sample optimism. The performance comparison does not indicate material overfitting.
 
 ---
 
-## 4. Feature Directionality Summary (Derived from SHAP Beeswarm Plots)
+## 3. AUC Stability Over Time (In-Time)
 
-The table below summarizes the **observed directional relationship** between feature values and predicted default risk, based on consistent patterns in SHAP beeswarm plots across IT and OOT samples.
+To assess performance stability, AUC was evaluated on a quarterly basis within the In-Time dataset.
 
-| Feature Name | Time Horizon | Observed Relationship with Default Risk |
-|-------------|-------------|------------------------------------------|
-| f_exp_jco_1_3m_mean_m_min_balance_to_mean_m_turnover | 1–3 months | Negative – higher values are associated with lower predicted default risk |
-| f_cat_jco_3m_Loan_Repayment_debit_mean | 3 months | Positive – higher values are associated with higher predicted default risk |
-| f_cat_jco_12m_Taxes_-_National_-_Corporate_Income_Tax_debit_stddev | 12 months | Positive – higher variability is associated with higher predicted default risk |
-| f_cat_jco_12m_Taxes_-_National_-_VAT_debit_min | 12 months | Negative – higher minimum values are associated with lower predicted default risk |
-| f_trx_jco_12m_credit_after_21_days_of_month_start_credit_min_ratio | 12 months | Positive – higher late-month credit reliance is associated with higher predicted risk |
-| f_cp_jco_12m_credit_acquisition_rate_std | 12 months | Positive – higher variability is associated with higher predicted default risk |
-| f_trx_m_jco_6m_abs_amt_sum_delta | 6 months | Positive – larger changes are associated with higher predicted default risk |
-| f_bal_jco_12m_balance_positive_value_min | 12 months | Negative – stronger balance buffers are associated with lower predicted risk |
-| f_cat_jco_12m_Leasing_debit_min | 12 months | Positive – higher fixed obligations are associated with higher predicted risk |
-| f_cat_jco_6m_Director_Transfers_debit_sum | 6 months | Positive – higher transfer amounts are associated with higher predicted risk |
-| f_cp_jco_12m_debit_count_of_cp_std | 12 months | Positive – higher variability is associated with higher predicted default risk |
-| f_exp_jco_1_6m_m_min_max_balance_ratio_max | 1–6 months | Positive – higher balance volatility is associated with higher predicted risk |
-| f_cp_jco_3m_credit_cp_diff_std | 3 months | Positive – higher counterparty variability is associated with higher predicted risk |
-| f_cat_jco_12m_Utilities_-_Water_debit_sum | 12 months | Negative – regular utility payments are associated with lower predicted risk |
-| f_trx_m_jco_6m_debit_after_21_days_of_month_start_sum_corr | 6 months | Positive – late-month debit concentration is associated with higher predicted risk |
-| f_exp_jco_1_12m_m_min_balance_min | 12 months | Negative – stronger long-term liquidity is associated with lower predicted risk |
-| f_trx_m_jco_12m_abs_amt_within_10_days_of_month_start_sum_corr | 12 months | Positive – early-month transaction concentration is associated with higher predicted risk |
-| f_trx_m_jco_3m_debit_within_10_days_of_month_start_min_delta | 3 months | Positive – short-term timing stress is associated with higher predicted risk |
-| f_trx_jco_12m_credit_le_50_mean | 12 months | Negative – higher frequency of small credits is associated with lower predicted risk |
+Observed AUC values range approximately between 0.68 and 0.82 across the evaluation period. Short-term fluctuations are visible; however, no persistent downward trend is observed across quarters.
 
-**Sign convention:**  
-- **Positive** → higher feature values are associated with higher predicted probability of default  
-- **Negative** → higher feature values are associated with lower predicted probability of default  
+Quarterly AUC estimates may vary due to differences in sample composition across periods. The absence of sustained deterioration suggests that the model’s discriminatory power remains stable over time within the development population.
 
 ---
 
-## 5. IT vs OOT Stability Assessment
+## 4. Calibration Analysis
 
-Comparison of gain-based importance, mean SHAP values, and SHAP beeswarm plots across IT and OOT samples indicates:
-- Stable ranking of key drivers
-- Consistent directional effects
-- No material sign reversals or loss of influence
+Calibration assesses how well predicted probabilities align with observed default rates. While discriminatory power measures ranking ability, calibration evaluates whether predicted risk levels are numerically reliable.
 
-These observations support the conclusion that the model relies on **structural financial patterns** rather than transient effects and that feature behavior remains stable when applied to new data.
+### 4.1 Calibration Curve
+
+Calibration performance was evaluated using a **calibration curve** generated via the `calibration_curve` function from scikit-learn.
+
+The calibration curve plots:
+
+- **Fraction of positives (observed default rate)** on the y-axis  
+- **Mean predicted probability** on the x-axis  
+
+Predictions are grouped into probability bins, and for each bin the average predicted probability and corresponding observed default rate are calculated. A perfectly calibrated model lies along the 45-degree diagonal.
+
+Calibration curves were evaluated for both In-Time (IT) and Out-of-Time (OOT) datasets.
+
+Both IT and OOT curves closely follow the diagonal reference line, indicating strong alignment between predicted probabilities and observed default rates. The majority of predicted probabilities are concentrated in the lower probability range, consistent with the overall portfolio default rate. Minor deviations are observed in certain probability bins; however, these deviations are limited in magnitude and do not indicate a systematic pattern of overestimation or underestimation. The OOT curve closely mirrors the IT curve, confirming stable calibration under temporal validation.
 
 ---
 
-## 6. Summary
+### 4.2 Expected Calibration Error (ECE)
 
-- Gain-based importance explains **which features the model used during training**
-- Mean SHAP values explain **which features most strongly influence predictions**
-- SHAP beeswarm plots explain **how feature values affect predicted risk**
-- IT vs OOT comparison validates **temporal robustness**
+Calibration quality was also quantified using **Expected Calibration Error (ECE)**, which measures the average absolute difference between predicted probabilities and observed default rates across bins.
 
-Overall, the explainability analysis indicates that the model’s predictions are driven by **intuitive, defensible financial behavior signals** and meet internal expectations for transparency and stability.
+| Dataset | Expected Calibration Error (ECE) |
+|----------|--------------------------------|
+| In-Time (IT) | 0.0093 |
+| Out-of-Time (OOT) | 0.0107 |
+
+The low ECE values for both IT and OOT indicate minimal average deviation between predicted and observed risk. The close alignment between IT and OOT ECE further supports calibration stability under temporal validation.
 
 ---
+
+## 5. Overall Assessment
+
+The model demonstrates:
+
+- Strong discriminatory power  
+- Stable performance under cross-validation  
+- Consistent Out-of-Time performance  
+- Stable quarterly discriminatory power  
+- Reliable and well-aligned probability calibration  
+
+Based on the combined discrimination, stability, and calibration analyses, the model exhibits robust generalization characteristics and is suitable for production deployment.
