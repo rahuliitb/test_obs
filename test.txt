@@ -1,1 +1,45 @@
+## 7. Challenger Model Overview
+
+In addition to the champion model, a challenger model was developed to provide a benchmark comparison and support model risk management requirements.
+
+### 7.1 Model Development Framework
+
+Both champion and challenger models share the same upstream development pipeline:
+
+- Data preprocessing
+- Feature engineering
+- Feature selection
+
+Following the final feature selection stage, **19 features** were retained. These same 19 features were used as inputs for both the champion and challenger models to ensure comparability.
+
+### 7.2 Challenger Model Specification
+
+The challenger model is based on **Logistic Regression**.
+
+Prior to model estimation:
+
+- Feature predictive power was reassessed using **Information Value (IV)**.
+- Optimal binning was performed using the `optbinning` package.
+- A minimum IV threshold of **0.05** was applied.
+- Selected features were discretized and transformed into **Weight of Evidence (WoE)** representations.
+- The WoE-transformed variables were then used as inputs to the logistic regression model.
+
+This approach follows a traditional scorecard-style modeling framework and provides a transparent, linear benchmark against the champion model.
+
+### 7.3 Performance Comparison
+
+The comparative discriminatory performance is summarized below:
+
+| Model | OOS AUC (%) | OOT AUC (%) |
+|--------|--------------|--------------|
+| Champion (LightGBM) | 75.11 | 74.50 |
+| Challenger (Logistic Regression) | 71.30 | — |
+
+The challenger model demonstrates lower out-of-sample discriminatory power relative to the champion model. The performance difference reflects the greater modeling flexibility of the gradient boosting approach used in the champion model.
+
+### 7.4 Summary
+
+The challenger model serves as a benchmark alternative using a more traditional modeling framework. While it provides interpretability through WoE-transformed features and a linear structure, its predictive performance is lower compared to the champion model.
+
+The comparison supports the selection of the champion model for production deployment based on superior discriminatory performance.
 
