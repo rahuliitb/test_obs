@@ -1,27 +1,23 @@
 pip install mkdocs-pdf-export-plugin weasyprint
 
-//* =========================================================
-   MKDOCS PDF EXPORT – STABLE VERSION
-   Works well for wide statistical/model validation tables
-========================================================= */
+/* =====================================================
+   FINAL VALIDATED PDF CONFIG – WIDE STAT TABLES
+   Tested logic for AUC / CI / OOS / OOT tables
+===================================================== */
 
-/* -------------------------
-   Page Setup
--------------------------- */
+/* ---------- Page Setup ---------- */
 
 @page {
-  size: A4 landscape;        /* Important for wide tables */
+  size: A4 landscape;
   margin: 12mm;
 
   @bottom-right {
     content: counter(page);
-    font-size: 10px;
+    font-size: 9px;
   }
 }
 
-/* -------------------------
-   Print Media Rules
--------------------------- */
+/* ---------- Print Rules ---------- */
 
 @media print {
 
@@ -33,7 +29,7 @@ pip install mkdocs-pdf-export-plugin weasyprint
     max-width: 100%;
   }
 
-  /* Hide navigation elements in PDF */
+  /* Hide navigation elements */
   .md-sidebar,
   .md-header,
   .md-footer,
@@ -41,62 +37,35 @@ pip install mkdocs-pdf-export-plugin weasyprint
     display: none !important;
   }
 
-  /* Improve page breaking */
+  /* Prevent awkward page breaks */
   h1, h2, h3 {
     page-break-after: avoid;
+  }
+
+  tr {
     page-break-inside: avoid;
   }
 
-  p, li {
-    page-break-inside: avoid;
+  thead {
+    display: table-header-group; /* Repeat header */
   }
 
-  /* Code block formatting */
-  pre {
-    white-space: pre-wrap !important;
-    word-wrap: break-word;
-    page-break-inside: avoid;
-  }
-
-  code {
-    white-space: pre-wrap !important;
-  }
-
-  /* ============================
-     TABLE HANDLING (KEY PART)
-  ============================= */
+  /* ---------- TABLE FIX ---------- */
 
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 10px;              /* Adjust if needed (9–11) */
-    page-break-inside: auto;
+    font-size: 9px;          /* Critical for fitting */
+    table-layout: auto;      /* Natural sizing */
   }
 
   th, td {
-    padding: 4px;
-    vertical-align: middle;
+    padding: 3px 4px;
     text-align: center;
-    white-space: normal;          /* Allow wrapping */
-    word-break: break-word;       /* Prevent clipping */
+    white-space: nowrap;     /* Prevent vertical splitting */
   }
 
-  /* Repeat header on new pages */
-  thead {
-    display: table-header-group;
-  }
-
-  tfoot {
-    display: table-footer-group;
-  }
-
-  /* Prevent row splitting */
-  tr {
-    page-break-inside: avoid;
-    page-break-after: auto;
-  }
-
-  /* Fix Material theme scroll wrapper */
+  /* Material theme scroll fix */
   .md-typeset__table {
     overflow: visible !important;
   }
