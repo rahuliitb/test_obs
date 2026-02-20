@@ -1,8 +1,27 @@
 pip install mkdocs-pdf-export-plugin weasyprint
 
-/* =====================================
-   CLEAN PDF FIX (NO COLUMN BREAKING)
-===================================== */
+//* =========================================================
+   MKDOCS PDF EXPORT – STABLE VERSION
+   Works well for wide statistical/model validation tables
+========================================================= */
+
+/* -------------------------
+   Page Setup
+-------------------------- */
+
+@page {
+  size: A4 landscape;        /* Important for wide tables */
+  margin: 12mm;
+
+  @bottom-right {
+    content: counter(page);
+    font-size: 10px;
+  }
+}
+
+/* -------------------------
+   Print Media Rules
+-------------------------- */
 
 @media print {
 
@@ -14,61 +33,72 @@ pip install mkdocs-pdf-export-plugin weasyprint
     max-width: 100%;
   }
 
-  /* Hide navigation */
+  /* Hide navigation elements in PDF */
   .md-sidebar,
   .md-header,
-  .md-footer {
+  .md-footer,
+  .md-tabs {
     display: none !important;
   }
 
-  /* Better page split */
+  /* Improve page breaking */
   h1, h2, h3 {
     page-break-after: avoid;
+    page-break-inside: avoid;
   }
 
   p, li {
     page-break-inside: avoid;
   }
 
-  /* Code blocks */
+  /* Code block formatting */
   pre {
+    white-space: pre-wrap !important;
+    word-wrap: break-word;
+    page-break-inside: avoid;
+  }
+
+  code {
     white-space: pre-wrap !important;
   }
 
-  /* ==============================
-     TABLE FIX (CORRECT VERSION)
-  ============================== */
+  /* ============================
+     TABLE HANDLING (KEY PART)
+  ============================= */
 
   table {
     width: 100%;
     border-collapse: collapse;
+    font-size: 10px;              /* Adjust if needed (9–11) */
     page-break-inside: auto;
-    table-layout: auto;      /* allow natural width */
-    font-size: 11px;         /* ✅ reduce table size */
   }
 
   th, td {
-    white-space: nowrap;     /* prevent vertical word splitting */
+    padding: 4px;
+    vertical-align: middle;
+    text-align: center;
+    white-space: normal;          /* Allow wrapping */
+    word-break: break-word;       /* Prevent clipping */
   }
 
+  /* Repeat header on new pages */
+  thead {
+    display: table-header-group;
+  }
+
+  tfoot {
+    display: table-footer-group;
+  }
+
+  /* Prevent row splitting */
   tr {
     page-break-inside: avoid;
+    page-break-after: auto;
   }
 
-  thead {
-    display: table-header-group; /* repeat header on new page */
-  }
-
-  /* Fix Material scroll wrapper */
+  /* Fix Material theme scroll wrapper */
   .md-typeset__table {
     overflow: visible !important;
   }
-}
 
-/* Optional page numbers */
-@page {
-  @bottom-right {
-    content: counter(page);
-    font-size: 10px;
-  }
 }
