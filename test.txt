@@ -1,29 +1,11 @@
 pip install mkdocs-pdf-export-plugin weasyprint
 
-
-site_name: My Documentation
-
-theme:
-  name: material   # or your existing theme
-
-plugins:
-  - search
-  - pdf-export:
-      combined: true        # generate one full PDF
-      media_type: print     # use print styles
-      verbose: true
-
-extra_css:
-  - stylesheets/pdf-export.css
-
-
 /* =====================================
-   PDF EXPORT FIXES
+   CLEAN PDF FIX (NO COLUMN BREAKING)
 ===================================== */
 
 @media print {
 
-  /* Full width layout */
   body {
     margin: 0;
   }
@@ -32,75 +14,61 @@ extra_css:
     max-width: 100%;
   }
 
-  /* Hide navigation in PDF */
+  /* Hide navigation */
   .md-sidebar,
   .md-header,
   .md-footer {
     display: none !important;
   }
 
-  /* Better page splitting */
+  /* Better page split */
   h1, h2, h3 {
     page-break-after: avoid;
-    page-break-inside: avoid;
   }
 
   p, li {
     page-break-inside: avoid;
   }
 
-  /* Code block wrapping */
+  /* Code blocks */
   pre {
-    white-space: pre-wrap !important;
-    word-wrap: break-word;
-    page-break-inside: avoid;
-  }
-
-  code {
     white-space: pre-wrap !important;
   }
 
   /* ==============================
-     TABLE FIX (NO COLUMN CLIPPING)
+     TABLE FIX (CORRECT VERSION)
   ============================== */
 
   table {
-    width: 100% !important;
-    table-layout: fixed;
+    width: 100%;
     border-collapse: collapse;
     page-break-inside: auto;
+    table-layout: auto;      /* allow natural width */
+    font-size: 11px;         /* ✅ reduce table size */
   }
 
   th, td {
-    word-break: break-word;
-    white-space: normal !important;
+    white-space: nowrap;     /* prevent vertical word splitting */
   }
 
   tr {
     page-break-inside: avoid;
-    page-break-after: auto;
   }
 
   thead {
-    display: table-header-group; /* repeat header on each page */
+    display: table-header-group; /* repeat header on new page */
   }
 
-  tfoot {
-    display: table-footer-group;
-  }
-
-  /* Material theme scroll fix */
+  /* Fix Material scroll wrapper */
   .md-typeset__table {
     overflow: visible !important;
   }
-
 }
 
-/* Optional: Add page numbers */
+/* Optional page numbers */
 @page {
   @bottom-right {
     content: counter(page);
     font-size: 10px;
   }
 }
-
