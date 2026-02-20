@@ -1,1 +1,106 @@
+pip install mkdocs-pdf-export-plugin weasyprint
+
+
+site_name: My Documentation
+
+theme:
+  name: material   # or your existing theme
+
+plugins:
+  - search
+  - pdf-export:
+      combined: true        # generate one full PDF
+      media_type: print     # use print styles
+      verbose: true
+
+extra_css:
+  - stylesheets/pdf-export.css
+
+
+/* =====================================
+   PDF EXPORT FIXES
+===================================== */
+
+@media print {
+
+  /* Full width layout */
+  body {
+    margin: 0;
+  }
+
+  .md-content {
+    max-width: 100%;
+  }
+
+  /* Hide navigation in PDF */
+  .md-sidebar,
+  .md-header,
+  .md-footer {
+    display: none !important;
+  }
+
+  /* Better page splitting */
+  h1, h2, h3 {
+    page-break-after: avoid;
+    page-break-inside: avoid;
+  }
+
+  p, li {
+    page-break-inside: avoid;
+  }
+
+  /* Code block wrapping */
+  pre {
+    white-space: pre-wrap !important;
+    word-wrap: break-word;
+    page-break-inside: avoid;
+  }
+
+  code {
+    white-space: pre-wrap !important;
+  }
+
+  /* ==============================
+     TABLE FIX (NO COLUMN CLIPPING)
+  ============================== */
+
+  table {
+    width: 100% !important;
+    table-layout: fixed;
+    border-collapse: collapse;
+    page-break-inside: auto;
+  }
+
+  th, td {
+    word-break: break-word;
+    white-space: normal !important;
+  }
+
+  tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+
+  thead {
+    display: table-header-group; /* repeat header on each page */
+  }
+
+  tfoot {
+    display: table-footer-group;
+  }
+
+  /* Material theme scroll fix */
+  .md-typeset__table {
+    overflow: visible !important;
+  }
+
+}
+
+/* Optional: Add page numbers */
+@page {
+  @bottom-right {
+    content: counter(page);
+    font-size: 10px;
+  }
+}
 
