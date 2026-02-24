@@ -1,73 +1,321 @@
-pip install mkdocs-pdf-export-plugin weasyprint
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 
-/* =====================================================
-   FINAL VALIDATED PDF CONFIG – WIDE STAT TABLES
-   Tested logic for AUC / CI / OOS / OOT tables
-===================================================== */
+def plot_industry_pd_curve(decile_table):
 
-/* ---------- Page Setup ---------- */
+    # Calculate population %
+    total_customers = decile_table["n_customers"].sum()
+    decile_table["population_%"] = decile_table["n_customers"] / total_customers
 
-@page {
-  size: A4 landscape;
-  margin: 12mm;
+    fig, ax1 = plt.subplots(figsize=(10,6))
 
-  @bottom-right {
-    content: counter(page);
-    font-size: 9px;
-  }
-}
+    # -----------------------------
+    # Population Distribution (Bar)
+    # -----------------------------
+    bars = ax1.bar(
+        decile_table["rank"],
+        decile_table["population_%"] * 100,
+        alpha=0.6
+    )
 
-/* ---------- Print Rules ---------- */
+    # for i, v in enumerate(decile_table["population_%"] * 100):
+    #     ax1.text(i+1, v + 0.5, f"{v:.1f}%", ha='center')
 
-@media print {
+    ax1.set_ylabel("Population Distribution (%)")
+    ax1.set_xlabel("Rank (1 = Low Risk, 10 = High Risk)")
+    ax1.set_xticks(decile_table["rank"])
 
-  body {
-    margin: 0;
-  }
+    # -----------------------------
+    # PD Curve (Line)
+    # -----------------------------
+    ax2 = ax1.twinx()
 
-  .md-content {
-    max-width: 100%;
-  }
+    ax2.plot(
+        decile_table["rank"],
+        decile_table["avg_pd"] * 100,
+        marker='o'
+    )
 
-  /* Hide navigation elements */
-  .md-sidebar,
-  .md-header,
-  .md-footer,
-  .md-tabs {
-    display: none !important;
-  }
+    for i, v in enumerate(decile_table["avg_pd"] * 100):
+        ax2.text(i+1, v + 0.5, f"{v:.1f}%", ha='center')
 
-  /* Prevent awkward page breaks */
-  h1, h2, h3 {
-    page-break-after: avoid;
-  }
+    ax2.set_ylabel("Probability of Default (%)")
 
-  tr {
-    page-break-inside: avoid;
-  }
+    plt.title("Industry Profile & PD Curve")
+    plt.show()
 
-  thead {
-    display: table-header-group; /* Repeat header */
-  }
+def full_cutoff_analysis(df, pd_col="pd", target_col="default"):
 
-  /* ---------- TABLE FIX ---------- */
+    df = df.copy()
 
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 9px;          /* Critical for fitting */
-    table-layout: auto;      /* Natural sizing */
-  }
+    # ============================================================
+    # PORTFOLIO SUMMARY
+    # ============================================================
 
-  th, td {
-    padding: 3px 4px;
-    text-align: center;
-    white-space: nowrap;     /* Prevent vertical splitting */
-  }
+    total_obs = len(df)
+    total_bad = df[target_col].sum()
+    total_good = total_obs - total_bad
+    overall_bad_rate = total_bad / total_obs if total_obs > 0 else 0
 
-  /* Material theme scroll fix */
-  .md-typeset__table {
-    overflow: visible !important;
-  }
+    print("="*90)
+    print("PORTFOLIO SUMMARY")
+    print("="*90)
+    print(f"Total Customers: {total_obs}")
+    print(f"Total Good: {total_good}")
+    print(f"Total Bad: {total_bad}")
+    print(f"Overall Bad Rate: {overall_bad_rate:.4f}")
 
-}
+    # ============================================================
+    # 1️⃣ RANKED DECILE ANALYSIS (Rank 1 = Lowest Risk)
+    # ============================================================
+
+    df_rank = df.sort_values(pd_col, ascending=True).reset_index(drop=True)
+    df_rank["rank"] = pd.qcut(df_rank[pd_col], 10, labels=False, duplicates="drop") + 1
+
+    decile_table = (
+        df_rank.groupby("rank")
+        .agg(
+            n_customers=(pd_col, "count"),
+            n_bad=(target_col, "sum"),
+            avg_pd=(pd_col, "mean"),
+            pd_min=(pd_col, "min"),
+            pd_max=(pd_col, "max")
+        )
+        .reset_index()
+        .sort_values("rank")
+    )
+
+    decile_table["n_good"] = decile_table["n_customers"] - decile_table["n_bad"]
+    decile_table["avg_bad_rate"] = decile_table["n_bad"] / decile_table["n_customers"]
+
+    decile_table["pd_range"] = (
+        decile_table["pd_min"].round(4).astype(str)
+        + " - " +
+        decile_table["pd_max"].round(4).astype(str)
+    )
+
+    decile_table["cum_customers"] = decile_table["n_customers"].cumsum()
+    decile_table["cum_bad"] = decile_table["n_bad"].cumsum()
+    decile_table["cum_population_%"] = decile_table["cum_customers"] / total_obs
+    decile_table["cum_bad_%"] = decile_table["cum_bad"] / total_bad if total_bad > 0 else 0
+
+    print("\n" + "="*90)
+    print("RANKED DECILE ANALYSIS (Rank 1 = Lowest Risk)")
+    print("="*90)
+    print(decile_table)
+
+    # ============================================================
+    # 2️⃣ CUMULATIVE GAIN + LIFT TABLE
+    # ============================================================
+
+    df_gain = df.sort_values(pd_col, ascending=False).reset_index(drop=True)
+    df_gain["risk_decile"] = pd.qcut(df_gain.index, 10, labels=False) + 1
+
+    gain_rows = []
+
+    for r in sorted(df_gain["risk_decile"].unique()):
+        rejected = df_gain[df_gain["risk_decile"] <= r]
+        approved = df_gain[df_gain["risk_decile"] > r]
+
+        n_rejected = len(rejected)
+        n_approved = len(approved)
+
+        n_bad_rejected = rejected[target_col].sum()
+        n_good_rejected = n_rejected - n_bad_rejected
+
+        n_bad_approved = approved[target_col].sum()
+        n_good_approved = n_approved - n_bad_approved
+
+        rejection_rate = n_rejected / total_obs
+        approval_rate = n_approved / total_obs
+        defaults_captured_pct = n_bad_rejected / total_bad if total_bad > 0 else 0
+
+        lift = ((n_bad_rejected / n_rejected) / overall_bad_rate
+                if n_rejected > 0 and overall_bad_rate > 0 else 0)
+
+        gain_rows.append({
+            "Top_Risk_Deciles_Rejected": r,
+            "n_rejected": n_rejected,
+            "n_good_rejected": n_good_rejected,
+            "n_bad_rejected": n_bad_rejected,
+            "rejection_rate": round(rejection_rate,4),
+            "approval_rate": round(approval_rate,4),
+            "rejected_default_rate": round(n_bad_rejected/n_rejected,4)
+                if n_rejected>0 else 0,
+            "approved_default_rate": round(n_bad_approved/n_approved,4)
+                if n_approved>0 else 0,
+            "defaults_captured_%": round(defaults_captured_pct,4),
+            "lift": round(lift,4)
+        })
+
+    gain_table = pd.DataFrame(gain_rows)
+
+    print("\n" + "="*90)
+    print("CUMULATIVE GAIN & LIFT TABLE")
+    print("="*90)
+    print(gain_table)
+
+    # ============================================================
+    # 3️⃣ APPROVAL VS BAD RATE TABLE (PD Threshold Based)
+    # ============================================================
+
+    df_sorted = df.sort_values(pd_col)
+    thresholds = np.quantile(df_sorted[pd_col], np.linspace(0.1, 0.9, 9))
+
+    thresholds = [0.03, 0.05, 0.07, 0.10, 0.15]
+    approval_rows = []
+
+    for t in thresholds:
+        approved = df_sorted[df_sorted[pd_col] <= t]
+        rejected = df_sorted[df_sorted[pd_col] > t]
+
+        n_approved = len(approved)
+        n_rejected = len(rejected)
+
+        n_bad_approved = approved[target_col].sum()
+        n_good_approved = n_approved - n_bad_approved
+
+        n_bad_rejected = rejected[target_col].sum()
+        n_good_rejected = n_rejected - n_bad_rejected
+
+        approval_rows.append({
+            "pd_cutoff": round(t,4),
+
+            "n_approved": n_approved,
+            "n_good_approved": n_good_approved,
+            "n_bad_approved": n_bad_approved,
+            "approved_default_rate": round(n_bad_approved/n_approved,4)
+                if n_approved > 0 else 0,
+
+            "n_rejected": n_rejected,
+            "n_good_rejected": n_good_rejected,
+            "n_bad_rejected": n_bad_rejected,
+            "rejected_default_rate": round(n_bad_rejected/n_rejected,4)
+                if n_rejected > 0 else 0,
+
+            "approval_rate": round(n_approved/total_obs,4),
+            "rejection_rate": round(n_rejected/total_obs,4),
+            "defaults_captured_%": round(n_bad_rejected/total_bad,4)
+                if total_bad > 0 else 0
+        })
+
+    approval_table = pd.DataFrame(approval_rows)
+
+    print("\n" + "="*90)
+    print("APPROVAL VS BAD RATE TABLE")
+    print("="*90)
+    print(approval_table)
+
+    # ============================================================
+    # 4️⃣ STRATEGIC OPTIONS
+    # ============================================================
+
+    aggressive = approval_table.iloc[-1]
+    balanced = approval_table.iloc[len(approval_table)//2]
+    conservative = approval_table.iloc[0]
+
+    strategy_table = pd.DataFrame({
+        "Strategy": ["Aggressive", "Balanced", "Conservative"],
+        "PD_Cutoff": [
+            aggressive["pd_cutoff"],
+            balanced["pd_cutoff"],
+            conservative["pd_cutoff"]
+        ],
+        "Approval_Rate": [
+            aggressive["approval_rate"],
+            balanced["approval_rate"],
+            conservative["approval_rate"]
+        ],
+        "Approved_Default_Rate": [
+            aggressive["approved_default_rate"],
+            balanced["approved_default_rate"],
+            conservative["approved_default_rate"]
+        ],
+        "Defaults_Captured_%": [
+            aggressive["defaults_captured_%"],
+            balanced["defaults_captured_%"],
+            conservative["defaults_captured_%"]
+        ]
+    })
+
+    print("\n" + "="*90)
+    print("STRATEGIC CUTOFF OPTIONS")
+    print("="*90)
+    print(strategy_table)
+
+    # ============================================================
+    # 5️⃣ ENHANCED PLOT (Rates + Population)
+    # ============================================================
+
+    fig, ax1 = plt.subplots()
+
+    ax1.plot(decile_table["rank"], decile_table["avg_pd"], marker='o')
+    ax1.plot(decile_table["rank"], decile_table["avg_bad_rate"], marker='o')
+    ax1.set_xlabel("Risk Rank (1 = Low Risk, 10 = High Risk)")
+    ax1.set_ylabel("Rate")
+
+    ax2 = ax1.twinx()
+    ax2.bar(decile_table["rank"], decile_table["n_customers"], alpha=0.3)
+    ax2.set_ylabel("Number of Customers")
+
+    plt.title("Rank vs Average PD, Average Bad Rate & Population")
+    ax1.set_xticks(decile_table["rank"])
+    ax1.legend(["Average PD", "Average Bad Rate"])
+    plt.show()
+
+
+        # ============================================================
+    # 5️⃣ INDUSTRY PROFILE PD CURVE
+    # ============================================================
+
+    plot_industry_pd_curve(decile_table)
+
+    return {
+        "decile_table": decile_table,
+        "gain_table": gain_table,
+        "approval_table": approval_table,
+        "strategy_table": strategy_table
+    }
+
+def plot_cutoff_summary(approval_table):
+
+    fig, ax1 = plt.subplots(figsize=(10,6))
+
+    # Left Axis (Rates)
+    ax1.plot(approval_table["pd_cutoff"],
+             approval_table["approval_rate"]*100,
+             marker='o')
+
+    ax1.plot(approval_table["pd_cutoff"],
+             approval_table["approved_default_rate"]*100,
+             marker='o')
+
+    ax1.plot(approval_table["pd_cutoff"],
+             approval_table["rejected_default_rate"]*100,
+             marker='o')
+
+    ax1.plot(approval_table["pd_cutoff"],
+             approval_table["defaults_captured_%"]*100,
+             marker='o')
+
+    ax1.set_xlabel("PD Cutoff")
+    ax1.set_ylabel("Rate (%)")
+
+    # Right Axis (Approved Volume)
+    ax2 = ax1.twinx()
+    ax2.bar(approval_table["pd_cutoff"],
+            approval_table["n_approved"],
+            alpha=0.2)
+
+    ax2.set_ylabel("Number Approved")
+
+    plt.title("Cutoff Strategy Trade-off Summary")
+    ax1.legend([
+        "Approval Rate",
+        "Approved Default Rate",
+        "Rejected Default Rate",
+        "Defaults Captured %"
+    ])
+
+    plt.show()
