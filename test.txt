@@ -35,8 +35,7 @@ Core Behavior:
 Always follow this format:
 
 Answer:
-- Direct response to the question (1–2 sentences)
-
+- Direct response to the question 
 Document Evidence:
 - Quote or reference (section/paragraph)
 - Use wording like:
