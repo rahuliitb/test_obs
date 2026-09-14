@@ -1,75 +1,313 @@
-You are a Model Developer with expertise in credit risk modeling and machine learning, responding to questions from Model Validation (MV).
+Yes. What you are describing is a **stacked / two-stage model**:
 
-Context:
-- Credit Acceptance Model
-- Non-regulatory
-- Business customers
-- Netherlands portfolio
+$$
+\text{Bureau features}\rightarrow XGB_B\rightarrow PD_B
+$$
 
-Your role is to explain and justify model development decisions as the developer who built the model, ensuring all responses are aligned with the Model Development Document (MDD) and Credit Acceptance Guidelines.
+$$
+\text{Transaction features}\rightarrow XGB_T\rightarrow PD_T
+$$
 
-Instructions:
-- Always respond from a Model Developer perspective, using first-person plural (e.g., “we used”, “we selected”, “we defined”).
-- Base your answers primarily on the Model Development Document and Credit Acceptance Guidelines.
-- Ensure all responses are factually consistent with the documented methodology.
+and then:
 
-Rules:
+$$
+(PD_B,PD_T)\rightarrow Logistic Regression\rightarrow PD_{final}
+$$
 
-1. Document Grounding (Mandatory)
-- Anchor every answer in the document using a reference, quote, or faithful paraphrasing.
-- Ensure traceability to a section, statement, or described methodology.
+This is a good architecture when you want the final combination to remain interpretable.
 
-2. Developer Ownership (Mandatory)
-- Speak as the model developer who made the decisions.
-- Use phrases like:
-  - “We used…”
-  - “We selected…”
-  - “We defined…”
-- Avoid neutral or passive narration (e.g., “the model uses…”).
+Suppose your meta-model is:
 
-3. Handling Partial Information
-- If the document provides partial information:
-  - Start with what is documented.
-  - Extend the answer using standard credit risk / ML reasoning ONLY if it is consistent with the document.
-  - Keep extensions minimal and aligned (no speculation beyond context).
+$$
+\operatorname{logit}(PD_{final})
+=
+\beta_0+
+\beta_B z_B+
+\beta_T z_T
+$$
 
-4. Handling Incorrect Assumptions
-- If the validator’s assumption is incorrect:
-  - Clearly correct it.
-  - Support the correction with document evidence.
-- Example:
-  “We did not use disbursement date; as stated in Section X, features are derived using application date.”
+where \(z_B\) and \(z_T\) are the outputs from the two XGBoost models.
 
-5. No Unsupported or Contradictory Claims
-- Do NOT introduce reasoning that contradicts the document.
-- If something is not explicitly stated:
-  - Say: “This is not explicitly specified in the document.”
-  - Optionally add a brief, standard explanation only if it remains fully aligned.
+### 1. First decide what to feed into logistic regression
 
-6. Conciseness and Clarity
-- Keep answers short, precise, and audit-ready (2–4 sentences).
-- Avoid unnecessary technical jargon or over-explanation.
+You could use the raw probabilities:
 
-7. Response Style (Mandatory)
-- The response must be written in a single coherent paragraph.
-- Do NOT use bullet points, numbered lists, or separate sections.
-- Integrate justification and document reference naturally within the paragraph.
+$$
+\operatorname{logit}(PD_{final})
+=
+\beta_0+\beta_B PD_B+\beta_T PD_T
+$$
 
-Response Expectation:
-- A single paragraph that:
-  - Answers the question directly
-  - Reflects developer ownership (“we…”)
-  - Includes justification
-  - References the document (e.g., “as stated in Section 3.2…”)
+but I would usually consider using the **log-odds** of the two model predictions:
 
-Examples:
+$$
+z_B = \log\frac{PD_B}{1-PD_B}
+$$
 
-Example 1:
-Question: Why did you use ROC AUC instead of PR AUC?
-Answer:
-We selected ROC AUC as the primary evaluation metric as defined in Section 4.1 of the Model Development Document, where it is specified as the standard measure for model discrimination, and this is consistent with typical practice in credit risk modeling.
+$$
+z_T = \log\frac{PD_T}{1-PD_T}
+$$
 
-Example 2:
-Question: Why did you use disbursement date for feature generation?
-Answer:
-We did not use disbursement date for feature generation; instead, we derived features based on the application date, as clearly specified in Section 2.3 of the Model Development Document.
+Then:
+
+$$
+\boxed{
+\operatorname{logit}(PD_{final})
+=
+\beta_0+
+\beta_B\operatorname{logit}(PD_B)
++
+\beta_T\operatorname{logit}(PD_T)
+}
+$$
+
+This tends to be more natural because your XGBoost classifiers and final logistic regression are operating on a compatible score scale.
+
+For example, suppose:
+
+$$
+PD_B = 20\%, \qquad PD_T=10\%
+$$
+
+Then:
+
+$$
+\operatorname{logit}(0.20)=-1.386
+$$
+
+$$
+\operatorname{logit}(0.10)=-2.197
+$$
+
+Suppose your meta-model is:
+
+$$
+\text{Final logit}
+=
+0.2
++
+0.7z_B
++
+0.4z_T
+$$
+
+Then:
+
+$$
+=0.2+0.7(-1.386)+0.4(-2.197)
+$$
+
+$$
+=-1.649
+$$
+
+and therefore:
+
+$$
+PD_{final}=\sigma(-1.649)\approx16.1\%
+$$
+
+So your final model says this borrower has approximately **16.1% PD**.
+
+---
+
+### 2. Explaining the final prediction becomes very clean
+
+At the **model-combination level**, you can explain:
+
+$$
+\underbrace{\beta_0}_{baseline}
++
+\underbrace{\beta_Bz_B}_{bureau\ contribution}
++
+\underbrace{\beta_Tz_T}_{transaction\ contribution}
+$$
+
+For one borrower, you might get:
+
+| Component         | Contribution to final log-odds |
+| ----------------- | -----------------------------: |
+| Intercept         |                          +0.20 |
+| Bureau model      |                          -0.97 |
+| Transaction model |                          -0.88 |
+| Final score       |                          -1.65 |
+| Final PD          |                      **16.1%** |
+
+This answers the first business question:
+
+> **How much did the bureau model versus transaction model contribute to this final risk assessment?**
+
+But usually you will want to go one level deeper.
+
+---
+
+### 3. Explain each XGBoost model separately with SHAP
+
+Suppose the bureau XGBoost prediction is:
+
+$$
+\operatorname{logit}(PD_B)
+=
+Base_B+\sum_j SHAP_{B,j}
+$$
+
+and the transaction model is:
+
+$$
+\operatorname{logit}(PD_T)
+=
+Base_T+\sum_k SHAP_{T,k}
+$$
+
+Now substitute these into the final logistic regression:
+
+$$
+\operatorname{logit}(PD_{final})
+=
+\beta_0+
+\beta_B
+\left(
+Base_B+\sum_j SHAP_{B,j}
+\right)
++
+\beta_T
+\left(
+Base_T+\sum_k SHAP_{T,k}
+\right)
+$$
+
+Expand it:
+
+$$
+=
+\beta_0
++\beta_B Base_B
++\beta_T Base_T
++\sum_j\beta_B SHAP_{B,j}
++\sum_k\beta_T SHAP_{T,k}
+$$
+
+And this gives you something very useful.
+
+For each **original bureau feature**:
+
+$$
+\boxed{
+Contribution_j=\beta_B\times SHAP_{B,j}
+}
+$$
+
+For each **original transaction feature**:
+
+$$
+\boxed{
+Contribution_k=\beta_T\times SHAP_{T,k}
+}
+$$
+
+So you can trace the final model prediction all the way back to the original variables.
+
+---
+
+### A concrete credit-risk example
+
+Imagine the Bureau XGBoost SHAP explanation is:
+
+| Bureau feature        |  SHAP |
+| --------------------- | ----: |
+| Past due count        | +0.70 |
+| Bureau score          | -0.50 |
+| Credit utilization    | +0.30 |
+| Credit history length | -0.20 |
+
+and:
+
+$$
+\beta_B=0.7
+$$
+
+Then their contributions to the **final stacked model** become:
+
+| Feature        | XGB SHAP | Meta coefficient | Final contribution |
+| -------------- | -------: | ---------------: | -----------------: |
+| Past due count |    +0.70 |             0.70 |          **+0.49** |
+| Bureau score   |    -0.50 |             0.70 |          **-0.35** |
+| Utilization    |    +0.30 |             0.70 |          **+0.21** |
+| History length |    -0.20 |             0.70 |          **-0.14** |
+
+Now suppose transaction SHAP values are:
+
+| Transaction feature   |  SHAP |
+| --------------------- | ----: |
+| Gambling transactions | +0.80 |
+| Salary stability      | -0.60 |
+| Overdraft frequency   | +0.50 |
+
+with:
+
+$$
+\beta_T=0.4
+$$
+
+Their final contributions are:
+
+| Feature               | XGB SHAP | Meta coefficient | Final contribution |
+| --------------------- | -------: | ---------------: | -----------------: |
+| Gambling transactions |    +0.80 |             0.40 |          **+0.32** |
+| Salary stability      |    -0.60 |             0.40 |          **-0.24** |
+| Overdraft frequency   |    +0.50 |             0.40 |          **+0.20** |
+
+You can therefore explain the final decision as:
+
+> The final PD is 16.1%. The main factors increasing risk were past-due history, gambling-related transactions, high utilization, and frequent overdrafts. Stable salary flows, a strong bureau score, and longer credit history reduced the estimated risk.
+
+That is much more interpretable than treating the ensemble as a black box.
+
+### One important training detail
+
+There is a major mistake to avoid when building this.
+
+Don't train your XGBoost models on the entire training dataset and then take their **in-sample predictions** to train the logistic regression. The second-stage model will receive overly optimistic predictions.
+
+Instead use **out-of-fold predictions**:
+
+```text
+Training data
+     │
+     ├── Bureau XGB ──────────────┐
+     │    OOF predictions         │
+     │                            ├── Logistic meta-model
+     └── Transaction XGB ─────────┤
+          OOF predictions         │
+                                  ↓
+                              Final PD
+```
+
+For example, with 5-fold CV:
+
+1. Train Bureau XGB on folds 1–4 → predict fold 5.
+2. Train Transaction XGB on folds 1–4 → predict fold 5.
+3. Repeat until every observation has an out-of-fold prediction.
+4. You now have `bureau_oof_pd` and `transaction_oof_pd`.
+5. Train logistic regression on those two columns.
+6. Retrain the two XGBoost models on all development data for production.
+
+This prevents **stacking leakage**.
+
+One final point: the simple `β × SHAP` decomposition is cleanest when the meta-model consumes the XGBoost **raw/logit outputs**, because SHAP's additive decomposition is normally on that raw scale. If your meta-model consumes probabilities instead, the sigmoid between XGBoost SHAP and the meta-model introduces non-linearity, so you should not blindly multiply probability-space SHAP values by the logistic coefficient.
+
+For a credit-risk setup where explainability matters, I'd favor:
+
+$$
+\boxed{
+\text{Original features}
+\rightarrow
+\text{XGBoost raw/logit scores}
+\rightarrow
+\text{Logistic regression}
+\rightarrow
+PD
+}
+$$
+
+It gives you both **model-level attribution** (bureau vs transaction) and **feature-level attribution** (which bureau/transaction variables drove the final PD).
